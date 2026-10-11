@@ -84,7 +84,7 @@ unloaded chat model is still flagged.
 
 ---
 
-### CLAUDE.md's claim about `/api/ps` context_length contradicts a live measurement `OPEN`
+### CLAUDE.md's claim about `/api/ps` context_length contradicts a live measurement `FIXED` (2026-10-11)
 
 **Severity:** low, but it is a documented fact other agents act on, and one of the two
 readings is wrong.
@@ -120,6 +120,32 @@ which on this fleet is 4x.
 **Do not "fix" the doc by picking a side.** Reproduce it: set a known
 `FLEET_NUM_CTX_OVERRIDES` value, cold-load the model, and compare launch args against
 `/api/ps` on the current Ollama. One measurement settles it.
+
+**Resolved 2026-10-11 on Ollama `0.40.2`. `/api/ps` `context_length` is the PER-SLOT
+value.** Run on two models whose configured contexts differ 4x, which the original
+single measurement could not discriminate — there, per-slot and total were being
+compared against one number each:
+
+| model | `FLEET_NUM_CTX_OVERRIDES` | launch args | per-slot (`-c ÷ -np`) | `/api/ps` `context_length` |
+|---|---|---|---|---|
+| `gpt-oss:120b` | 131072 | `-c 524288 -np 4` | **131072** | **131072** |
+| `gemma3:27b` | 32768 | `-c 131072 -np 4` | **32768** | **32768** |
+
+If the field reported the total, `gpt-oss` would read 524288 and `gemma3` 131072.
+Both read per-slot. Blobs were matched to models by on-disk weight size (65.4 GB vs
+16.5 GB) rather than by equality against a context number — a first attempt paired
+`gpt-oss` to `gemma3`'s launch line on a coincidental `-c 131072` match and printed
+"TOTAL", which is exactly the sort of accident that produced the original
+contradiction.
+
+So the gotcha's **advice stands and its stated reason does not.** Read the launch args
+because they show `-c` *and* `-np`, which is what tells you total KV allocation;
+`context_length` alone gives the per-slot window and nothing about how many slots
+multiply it. Corrected in CLAUDE.md. A check reading `context_length` and treating it
+as per-slot is correct on 0.40.2 — the three "possibilities" above resolve to "the
+original observation conflated the two", since the 2026-09-22 incident's per-slot
+context really was 32768 and `ollama ps` would have shown 32768, not the 131072 the
+note implies.
 
 ---
 
@@ -2436,9 +2462,20 @@ Building it found a regression of its own, now fixed. Starlette ends a disconnec
 
 ---
 
-### Ollama 3-model concurrent-load cap unconfigurable on macOS (upstream) `OPEN`
+### Ollama 3-model concurrent-load cap unconfigurable on macOS (upstream) `DISPROVEN` (2026-07-17)
 
-**Severity:** Medium
+> **Not a live issue.** Measured on Ollama `0.32.1` with `OLLAMA_MAX_LOADED_MODELS=10`:
+> **4 concurrent residents** were observed, so the cap is not hardcoded to 3. Re-confirmed
+> incidentally on `0.40.2` (2026-10-11), where three `llama-server` runners were resident
+> at once during the duplicate-digest incident. Nodes now report their own cap in the
+> heartbeat (`OllamaMetrics.max_loaded_models`) and the router uses it via
+> `hot_model_cap_for(node)`; `OLLAMA_HOT_MODEL_CAP = 3` survives only as the fallback for
+> agents that report nothing, which is Ollama's documented default. The still-true part is
+> narrower: `OLLAMA_MAX_LOADED_MODELS=-1` is silently invalid (parsed as unsigned, falls
+> through to the default) — use a positive integer. Kept for the upstream links and the
+> env-var parsing detail.
+
+**Severity:** Medium (as originally filed)
 **Discovered:** 2026-04-22 — during Claude Code + ollama-herd setup on a 512GB M3 Ultra Mac Studio
 **Upstream:** [ollama/ollama#7041](https://github.com/ollama/ollama/issues/7041), [#4855](https://github.com/ollama/ollama/issues/4855), [#5722](https://github.com/ollama/ollama/issues/5722), [#14953](https://github.com/ollama/ollama/issues/14953)
 
