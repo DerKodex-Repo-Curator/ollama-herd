@@ -217,9 +217,21 @@ measured; widening it remains a service-side question.)*
 2. Does `GLM-4.7-Flash-MLX-4bit` justify itself at 26 requests in 86 days, given
    the OPEN upstream issue that GLM is ~4x too slow **on Ollama**? If MLX is the
    only viable GLM path, this is dormant-but-needed, which is a keep.
-3. Is 33 GB for dormant capability an acceptable premium? It is 6.4% of this
-   512 GB box — and **26% of the 128 GB MacBook Pro**, which is the shape most
-   community installs have (18 of 20 herds run 1–2 machines).
+3. ~~Is 33 GB for dormant capability an acceptable premium?~~ **WITHDRAWN
+   2026-10-11 — this was not a real question.** The 33 GB is two
+   `mlx_lm.server` children holding weights resident (17.0 + 16.0), which is the
+   price of answering without a ~30 s cold load, not waste. On this box it costs
+   nothing measurable: **334 GB available of 512**, swap `0.00M`, kernel
+   pressure level **1**, and `underutilized_memory` is actively advising that
+   the node *could hold more models*. And the small-machine version of the
+   concern (25.8% of 128 GB, 51.6% of 64 GB) is not a trade-off either, because
+   `FLEET_NODE_MLX_SERVERS` is **already per-node config** — a constrained node
+   lists no servers and runs none.
+
+   The narrow residual, which is a different issue: an idle MLX server has been
+   observed **externally SIGKILLed on a saturated box** (OPEN in
+   `docs/issues.md`, likely OS memory pressure). That is about saturation, not
+   about the 33 GB, and this box is nowhere near it.
 
 **Done when** the outcome is recorded as **invest**, **hold** or **deprecate**,
 with the reason.
