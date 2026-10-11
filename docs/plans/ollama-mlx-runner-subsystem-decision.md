@@ -1,6 +1,30 @@
 # Ollama's native MLX runner — deciding our MLX subsystem's fate
 
-**Status**: **PHASE 2 DONE (2026-10-11). BLOCKED ON A DECISION, NOT ON WORK.**
+**Status**: ✅ **RESOLVED — HOLD (2026-10-11).** Phase 1's decision is made and
+Phase 2 is implemented. **Phases 3–4 are correctly not run** — they exist only
+under *invest*, and the decision is *hold*. All three Phase 1 sub-questions are
+answered: compaction (not a bug), the 33 GB premium (withdrawn, not a real
+question), and GLM (measured — MLX is the only usable path).
+
+> **The decision: hold.** Keep the `mlx_lm.server` subsystem, stop extending it,
+> and do not measure Ollama-MLX feature parity. The deciding evidence is
+> `GLM-4.7-Flash`, and it is not close: all-time on this box, Ollama has **30
+> completions against 235 requests retried at the 600 s timeout and 12
+> failures** (worst 87 minutes), while MLX has **27 completions and 1 failure**
+> and answered in 2.93 s for 84 tokens. **89% of Ollama attempts never completed
+> normally.**
+>
+> So this is not dormant capability kept on sentiment — it is the only working
+> path for a model this fleet serves, and that reasoning holds for any
+> open-source user running GLM. *Hold* costs nothing: nothing is extended,
+> nothing removed, no deprecation notice owed.
+>
+> **What would reopen it:** Ollama fixing `glm4moelite`
+> ([ollama#14045](https://github.com/ollama/ollama/issues/14045)), which would
+> make Phase 3 worth running.
+
+*Superseded status line, kept for the trail: "PHASE 2 DONE. BLOCKED ON A
+DECISION, NOT ON WORK."*
 Phase 1's three sub-questions are 2-of-3 resolved — compaction answered (not a
 bug), the 33 GB question withdrawn as not real — leaving **one** open: does
 `GLM-4.7-Flash-MLX-4bit` justify itself at 26 requests in 86 days, given that
@@ -183,7 +207,7 @@ new reporting belongs there.
 
 ---
 
-## Phase 1 — Choose invest / hold / deprecate, which gates the rest
+## Phase 1 — Choose invest / hold / deprecate, which gates the rest — ✅ DECIDED: HOLD (2026-10-11)
 
 No code. Two separable questions, and only the operators hold the second.
 
@@ -220,10 +244,20 @@ measured; widening it remains a service-side question.)*
    budget — on the MLX path. The capability was relevant to a real workload;
    that workload is simply not the current one. An argument for **hold**, not
    for removal.
-2. Does `GLM-4.7-Flash-MLX-4bit` justify itself at 26 requests in 86 days, given
-   the OPEN upstream issue that GLM is ~4x too slow **on Ollama**? If MLX is the
-   only viable GLM path, this is dormant-but-needed, which is a keep.
-3. ~~Is 33 GB for dormant capability an acceptable premium?~~ **WITHDRAWN
+2. ~~Does `GLM-4.7-Flash-MLX-4bit` justify itself at 26 requests in 86 days?~~
+   **ANSWERED 2026-10-11 — yes, it is the only usable path, which is a keep.**
+   Measured on `0.40.2` over all-time traces: Ollama **30 completed / 235
+   retried at the 600 s timeout / 12 failed** (worst 87 min) against MLX
+   **27 completed / 1 failed**. 89% of Ollama attempts never completed
+   normally; MLX answered in 2.93 s for 84 tokens the same afternoon. Ollama
+   also emits ~6x the output tokens (3,268 vs 556) for comparable work — the
+   interleaved-thinking symptom compounding the slowness. **Low request *count*
+   was the wrong question**; the right one was whether the alternative works,
+   and it does not.
+
+   Attempting the comparison also wedged Ollama into serving `/api/version`
+   while unable to start any runner, reproducing the OPEN "watchdog can't
+   escalate" issue and requiring the documented full restart.
    2026-10-11 — this was not a real question.** The 33 GB is two
    `mlx_lm.server` children holding weights resident (17.0 + 16.0), which is the
    price of answering without a ~30 s cold load, not waste. On this box it costs
@@ -278,7 +312,7 @@ pre-0.40 Ollama and an older node agent are unaffected; six tests in
 real captured 0.40.2 payload and a test that `runner` is never confused with
 herd's own `mlx:` routing prefix.
 
-## Phase 3 — Importability, only if Phase 1 chose *invest*
+## Phase 3 — Importability, only if Phase 1 chose *invest* — ⏸ NOT RUN (decision was *hold*)
 
 The real coverage question, narrowed by the audit: can Ollama **import** the MLX
 weights we already have — `ollama create` from `mlx-community/…` safetensors —
@@ -299,7 +333,7 @@ measured), not free for interactive serving.
 **Done when** each model is classified *importable and MLX-selected* /
 *importable but llama.cpp* / *not importable*, with gaps confirmed either way.
 
-## Phase 4 — Decide, per model, and reconcile the docs
+## Phase 4 — Decide, per model, and reconcile the docs — ⏸ NOT RUN (Phase 1 decided it)
 
 | outcome | consequence |
 |---|---|
