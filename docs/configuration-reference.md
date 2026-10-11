@@ -233,7 +233,11 @@ Modes:
 
 A model with no heartbeat yet has no known resident context, so nothing is pinned and the request passes through untouched.
 
-Only applies to Ollama-format requests (`/api/chat`, `/api/generate`). OpenAI-format requests don't have a `num_ctx` equivalent — which is the root cause of the field report in `docs/plans/context-window-blindness.md`; herd calls `/api/chat` downstream, so its own window control is unaffected.
+**Applies to every request format**, including OpenAI (`/v1/chat/completions`), Anthropic (`/v1/messages`) and Responses (`/v1/responses`) — herd calls `/api/chat` downstream regardless, so it sets `num_ctx` there on the client's behalf even when the client's own protocol has no field for it.
+
+> **Corrected 2026-10-11.** This section previously said protection applied *only* to Ollama-format requests, on the reasoning that an OpenAI-format request has no `num_ctx` field. That was accurate about the client protocol and wrong about herd: `_apply_context_protection` was only called on the Ollama/Anthropic/Responses branch of `_build_ollama_body`, so OpenAI-format requests reached Ollama with **no `num_ctx` at all** and got whatever `OLLAMA_CONTEXT_LENGTH` or the GPU heuristic chose. Measured: a cold load of `glm-4.7-flash` over `/v1/chat/completions` came up at 131072/slot instead of its configured 32768 and sat at **48 GB resident for a 19 GB model**. Fixed, and `tests/test_server/test_context_protection_every_format.py` now parametrizes every format so one surface cannot silently miss the call again.
+
+**One gotcha in the override keys.** `FLEET_NUM_CTX_OVERRIDES` is looked up against the **normalized** model name, and herd normalizes `glm-4.7-flash` to `glm-4.7-flash:latest`. A bare key therefore never matches, silently, and the model cold-loads at Ollama's default. **Write the key exactly as `ollama list` shows it, tag included** — or list both spellings, which is what this reference fleet does. `TestOverrideKeyNormalization` pins the current behaviour.
 
 ### Pre-Warm
 

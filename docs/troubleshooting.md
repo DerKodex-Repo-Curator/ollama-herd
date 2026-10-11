@@ -311,6 +311,93 @@ reasoning tokens — verified: `num_predict=24` gave `eval_count=24` with zero
 content), and the 48,000-odd traces that carry `NULL` counts because their route
 never surfaces them (embeddings, MLX). `NULL` is not zero.
 
+## One model is resident twice (an Ollama upgrade rewrote its digest)
+
+`ollama ps` shows the same model name on two rows, each holding its own copy of
+the weights. An Ollama upgrade can rewrite the manifest digest of an **already
+resident** model; the next request for that name resolves to the new digest,
+which Ollama treats as a different model and loads as a second runner. With
+`OLLAMA_KEEP_ALIVE=-1` neither copy ever idles out.
+
+Observed 2026-10-10 on both of this fleet's models after `0.40.2` arrived with a
+reboot: resident memory went 114 GB, then **156 GB**, for two logical models.
+
+```bash
+curl -s localhost:11434/api/ps | python3 -c "
+import json,sys,collections
+d=json.load(sys.stdin)['models']; by=collections.defaultdict(list)
+for m in d: by[m['name']].append(m['digest'][:12])
+print({n:g for n,g in by.items() if len(g)>1} or 'no duplicates')"
+```
+
+**The fix needs `ollama stop` twice.** The first call takes the *current* digest
+and leaves the stale one — measured on both models, so this is not a fluke:
+
+```bash
+ollama stop <model>          # removes the current digest
+ollama stop <model>          # removes the stale one
+curl -s localhost:11435/api/generate -d '{"model":"<model>","prompt":"hi","stream":false}' >/dev/null
+```
+
+That last request cold-loads through the router so the configured `num_ctx`
+applies. Since 0.11.1 the `duplicate_runners` health check finds this
+automatically and names the reclaimable GB; it rates WARNING above ~32 GB and
+INFO below, and calls out explicitly when the two runners disagree on context —
+which is when herd stops injecting `num_ctx` for that model, because there is no
+longer one right answer.
+
+---
+
+## An `mlx:` model returns a connection error
+
+Before 0.11.1 a request for an `mlx:` model that no node hosts was sent to
+whatever was listening on `FLEET_MLX_URL`'s legacy default (`localhost:11440`)
+and failed with `All connection attempts failed` or a `404` from the wrong
+server — 63 traced instances here, all blaming transport for configuration.
+
+The error now names the cause and the fix. Three retryable cases (the hosting
+node is offline, the server is configured but not healthy yet, or no node is
+online) come with `Retry-After`; "nothing is configured for this model" does not,
+and the message lists the models that **are** served, which usually reveals a
+typo or a stale model id.
+
+```bash
+# what the fleet actually serves
+curl -s localhost:11435/fleet/status | python3 -c "
+import json,sys
+for s in json.load(sys.stdin)['nodes'][0].get('mlx_servers') or []:
+    print(f\"mlx:{s['model']}  port={s['port']}  {s['status']}\")"
+```
+
+Two health checks cover the standing cases: **`mlx_routing_disabled`** when a
+node is running `mlx_lm.server` subprocesses while the router has
+`FLEET_MLX_ENABLED` unset — the node holds the weights and every request 503s,
+which nothing surfaced before because `mlx_backend_active` fires INFO on exactly
+that state — and **`mlx_requests_unservable`** when traffic arrives for an
+`mlx:` model no healthy server hosts (INFO for a single request, since a one-off
+probe of a wrong name is not a fault; WARNING for repeat traffic).
+
+---
+
+## A health card reports a high error rate on a node with almost no traffic
+
+Rate checks need a denominator. `high_error_rate` fires at 5%, so before 0.11.1
+a **single** failure crossed it at any total of 20 or fewer — and all MLX traffic
+carries `node_id=mlx-local`, a pseudo-node with a few hundred lifetime requests.
+The card read *"33.3% error rate in the last 24h (1/3 requests failed)"* while
+the fleet was at 0.0% across thousands, and its remediation pointed an operator
+at a healthy node.
+
+The floor is now derived from the threshold (`_min_samples_for_rate`), so the two
+cannot drift: 5% needs 21 requests, 0.3 retries/request needs 4. Below the floor
+the finding is still reported — silence would hide 3-of-3 failures as effectively
+as WARNING over-reported 1-of-3 — but as an INFO card that names its own sample
+size. Checks that fire on **absolute counts** (`stream_reliability`'s
+`no_output >= 1`, `embed_error_rate`'s `failed >= 1`) deliberately have no floor:
+one failed load that reads to a client as a refusal is what they exist to show.
+
+---
+
 ## A model keeps coming back at the wrong context
 
 If `FLEET_NUM_CTX_OVERRIDES` sets a model to one value and

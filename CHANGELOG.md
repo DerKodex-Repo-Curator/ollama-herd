@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`/v1/chat/completions` got no context protection at all.** `_apply_context_protection` was called only on the Ollama/Anthropic/Responses branch of `_build_ollama_body`; OpenAI-format requests fell through to the builder below, which applied thinking-model inflation but not the protection. So that surface had no `FLEET_NUM_CTX_OVERRIDES` injection, no resident-context pin, no overflow detection and no strip/upgrade. Proven with a model that has no other callers: **0** context-protection actions over `/v1/chat/completions` against **1** over `/api/generate`. Measured cost — a cold load of `glm-4.7-flash` over the OpenAI route came up at 131072/slot instead of its configured 32768 and sat at **48 GB resident for a 19 GB model**. The new tests parametrize all four formats and assert the call happens exactly once, which is the only shape that catches one surface missing it.
+
+  This corrects a conclusion recorded in `docs/plans/context-window-blindness.md`, that the originating field report's root cause did not reach herd because herd calls `/api/chat` downstream. True about the protocol, wrong about the consequence: herd calls `/api/chat` but never *added* `num_ctx` for OpenAI-format requests.
+
+- **An `mlx:` model no node hosts was sent to whatever held the legacy port.** `_resolve_url` fell back to `FLEET_MLX_URL` (default `localhost:11440`) whenever the resolver said no node hosts a model, producing **48 traced `404 Not Found` from `http://127.0.0.1:11440` and 15 `All connection attempts failed`** — every one blaming the network or a wrong server for a configuration problem, and had that port hosted a different model, the wrong model would have answered. A resolver's "no" is now authoritative; the fixed URL still serves genuine single-server deploys and the model-agnostic callers, and a *raising* resolver still falls back since a bug on our side is not an answer about the model. `no_mlx_server_reason` then classifies the cause and names the models that **are** served, which turns a dead end into a correctable typo.
+
+- **Rate health checks had no minimum denominator.** `high_error_rate` fires at 5%, so a single failure crossed it at any total of 20 or fewer — and all MLX traffic carries `node_id=mlx-local`, a pseudo-node with a few hundred lifetime requests. The card read *"33.3% error rate in the last 24h (1/3 requests failed)"* while the fleet was at 0.0% across thousands, with remediation aiming an operator at a healthy node. `_min_samples_for_rate` derives the floor from the threshold so the two cannot drift (5% → 21, 0.3 retries/request → 4). Below the floor the finding is still reported, as an INFO card naming its own sample size, because silence would hide 3-of-3 failures as effectively as WARNING over-reported 1-of-3. Applied to `high_error_rate` and `retry_rate` only — `stream_reliability` and `embed_error_rate` fire on absolute counts, where a denominator would have undone what 0.11.0 deliberately made visible.
+
+- **One model resident twice made "the resident context" ambiguous.** An Ollama upgrade can rewrite the manifest digest of an already-resident model, after which the next request for that name loads the new digest as a *second* runner — observed on both of this fleet's models (114 GB, then 156 GB, for two logical models; `KEEP_ALIVE=-1` meant neither idled out). `LoadedModel` carried no digest, so herd could not tell two runners apart, and ~15 call sites disagreed about what to do — including the `num_ctx` pin, which took the **first** match. Both live duplicates happened to agree on context, so the pin was right by luck.
+
+  `serializers.resident_context_for` is now the single definition and returns *unknown* when runners disagree, which routes into the pin's existing pass-through rather than becoming a third code path. Counts now distinguish runners (VRAM — two runners are two processes holding real memory) from logical models (`free_slots`, `models_loaded_count`, `underutilized_memory`).
+
+### Added
+
+- **`LoadedModel.runner` and `LoadedModel.digest`**, from fields `/api/ps` already reported and herd discarded. `runner` is what Ollama 0.40 chose per model (MLX is the default on Apple Silicon, selected by `IsMLX()` == `format == "safetensors"`), so "served by Ollama" stopped being one thing; `ModelTagMeta.format` *predicts* the choice and this reports what was done, and a divergence means our model of Ollama's selection — which `decode_parallelism_for` depends on — is wrong. The node card's existing backend label now names the runner when it is not the `llamacpp` default. Both default to `""`, so a pre-0.40 Ollama and older node agents are unaffected.
+
+- **Three health checks (49 total).** `duplicate_runners` — one name, two digests, one node: names the reclaimable GB, rates by it rather than by the fact of duplication, calls out divergent contexts, and carries the non-obvious remediation (`ollama stop` **twice**, because the first call takes the current digest). `mlx_routing_disabled` — a node running `mlx_lm.server` while the router has `FLEET_MLX_ENABLED` unset, which nothing surfaced because `mlx_backend_active` fires INFO on exactly that state. `mlx_requests_unservable` — traffic for an `mlx:` model no healthy server hosts.
+
+### Changed
+
+- **`GLM-4.7-Flash` is confirmed MLX-only on Apple Silicon.** Measured over all-time traces: via Ollama, **30 completions against 235 requests retried at the 600 s timeout and 12 failures** (worst 87 minutes); via MLX, **27 completions and 1 failure**, answering in 2.93 s for 84 tokens. 89% of Ollama attempts never completed normally, and Ollama emits ~6x the output tokens (3,268 vs 556) for comparable work. Two earlier notes claiming Ollama had become faster are not reproducible and are corrected. This resolves `docs/plans/ollama-mlx-runner-subsystem-decision.md` to **hold**.
+
+### Fixed (tests)
+
+- An autouse `conftest` fixture clears `streaming._context_protection_events` around every test. It is a process-wide list, so events leaked across modules: three health-engine tests failed on events they never created, each passing in isolation while the suite passed on whatever order pytest picked. The new format tests record 20 more and turned that latent order dependency reliably red, which is the better failure.
+
 ## [0.11.0] - 2026-10-11
 
 ### Added
