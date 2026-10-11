@@ -149,7 +149,7 @@ note implies.
 
 ---
 
-### `high_error_rate` has no minimum sample size, so three requests can trip a WARNING `OPEN` (2026-10-11)
+### `high_error_rate` has no minimum sample size, so three requests can trip a WARNING `FIXED` (2026-10-11)
 
 **Severity:** LOW-MEDIUM — a WARNING an operator cannot act on is how a board
 stops being read, and this is the **seventh** check in three weeks found firing
@@ -180,6 +180,42 @@ Below the floor the honest severity is INFO or silence, not WARNING.
 dividing a failure count by a request count over a window is exposed to the same
 thing, and `mlx-local`'s small denominator is the general case for every
 low-traffic backend, not a quirk of this one.
+
+**Fixed 2026-10-11.** `HealthEngine._min_samples_for_rate(rate)` returns the
+smallest denominator at which one event cannot cross `rate`, **derived from the
+threshold** so the two cannot drift — 5% → 21, 0.3 retries/request → 4.
+
+| check | shape | action |
+|---|---|---|
+| `_check_error_rates` | rate, 5% | floor applied; below it the card is **INFO naming its own sample size**, not WARNING |
+| `_check_retry_rates` | rate, 0.3/req, fleet-wide | floor applied; silent below it (a small fleet-wide denominator only occurs just after a restart) |
+| `_check_stream_reliability` | **absolute count** (`no_output >= 1`) | **left alone** — one failed load reading as a refusal is what 0.11.0 made visible on purpose |
+| `_check_embed_error_rate` | **absolute count** (`failed >= 1`) | **left alone**, same reason |
+
+So only two of the four were exposed; the other two would have been *broken* by a
+denominator. `_check_model_load_timeouts` (`total_count < 3`) and
+`_check_decode_degraded` (`DECODE_MIN_SAMPLES = 20`) already had floors — the
+pattern existed in this file and these two checks simply did not use it.
+
+**The floor reports rather than hides.** Below it the finding still appears, with
+its sample size stated, because silence would conceal 3-of-3 failures as
+effectively as WARNING over-reported 1-of-3.
+
+**One trap worth keeping:** the first implementation used `1.0 // rate`, and
+`1.0 // 0.05` is **19.0** — 0.05 has no exact binary form, so 1/0.05 computes as
+19.999999999999996 and the floor truncates a whole unit. That returned 20, where
+one failure is exactly 5.0%, and since the gate is `< threshold`, 5.0 is not
+below 5.0 and the check fired anyway. **The off-by-one defeated the entire fix
+while the arithmetic looked right**, and the live card was unchanged. Now
+`math.floor(1.0 / rate + 1e-9) + 1`, with a test asserting both the defining
+property (`1/n < rate`) and minimality (`1/(n-1) >= rate`) at four thresholds, plus
+one pinning the float behaviour itself.
+
+Verified live: the `mlx-local` card went from WARNING *"33.3% error rate in the
+last 24h (1/3 requests failed)"* to INFO *"1 of 3 requests failed … 3 request(s)
+is too small a sample to call a rate — below 21 a single failure crosses the 5%
+threshold on its own."* Health score 78 → 85. Covered by
+`tests/test_server/test_sample_floor.py` (16 tests).
 
 ---
 

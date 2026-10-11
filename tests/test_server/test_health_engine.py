@@ -232,7 +232,13 @@ class TestTraceChecks:
 
     @pytest.mark.asyncio
     async def test_error_rate_resolved_when_recent_is_clean(self, store):
-        """High error rate in 24h but clean recent window → resolved info."""
+        """High error rate in 24h but clean recent window → resolved info.
+
+        The denominator is deliberately above the sample floor
+        (`_min_samples_for_rate(5%)` = 21). Below it the check reports a
+        small-sample INFO instead, which is a different card — see
+        `test_sample_floor.py`. This test is about the *recovery* path.
+        """
         engine = HealthEngine()
         # Insert old failures (6h ago)
         old_ts = time.time() - 6 * 3600
@@ -244,8 +250,9 @@ class TestTraceChecks:
                 (f"old-fail-{i}", "phi4:14b", "phi4:14b", "flaky",
                  "failed", 500.0, old_ts + i),
             )
-        # Insert recent successes (within last hour)
-        for i in range(5):
+        # Insert recent successes (within last hour).  25, not 5, so the 24h
+        # denominator (30) clears the sample floor of 21.
+        for i in range(25):
             await store.record_trace(
                 request_id=f"recent-ok-{i}",
                 model="phi4:14b",

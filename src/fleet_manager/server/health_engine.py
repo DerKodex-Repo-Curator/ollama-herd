@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from enum import StrEnum
 
@@ -2994,11 +2995,84 @@ class HealthEngine:
                 )
         return recs
 
+    @staticmethod
+    def _min_samples_for_rate(rate_threshold: float) -> int:
+        """Smallest denominator at which ONE event cannot cross ``rate_threshold``.
+
+        Derived from the threshold rather than hardcoded, so the two cannot
+        drift.  A rate check with no floor is not measuring a rate: at a 5%
+        threshold a single failure crosses it at any total of 20 or fewer, so
+        the card reports "33.3% error rate" for one failure in three requests.
+
+        Observed 2026-10-11: two probe requests for a deliberately nonexistent
+        MLX model plus one real one all landed on the ``mlx-local`` pseudo-node
+        -- the only ``node_id`` MLX traffic carries -- giving it a 24 h window of
+        1 failed of 3 total. The card read *"33.3% error rate in the last 24h
+        (1/3 requests failed)"* while the fleet was at **0.0%** across thousands
+        of requests. Low-traffic backends are the general case for this, not a
+        quirk of that one: ``mlx-local`` has 233 lifetime requests.
+
+        ``rate_threshold`` is events per request (0.05 for 5%), so:
+        5% -> 21, 0.3 retries/request -> 4.
+
+        The floor deliberately does NOT suppress the finding; it suppresses the
+        *severity*. A genuinely broken low-traffic backend still earns a card
+        that names its sample size, because silence below the floor would hide
+        3-of-3 failures as effectively as WARNING over-reports 1-of-3.
+        """
+        if rate_threshold <= 0:
+            return 1
+        # The epsilon is load-bearing.  ``1.0 // 0.05`` is **19.0**, not 20:
+        # 0.05 has no exact binary form, so 1/0.05 computes as
+        # 19.999999999999996 and the floor truncates a whole unit.  That gave a
+        # floor of 20, at which one failure is exactly 5.0% -- and the gate is
+        # ``< threshold``, so 5.0 is not below 5.0 and the check fired anyway.
+        # The off-by-one defeated the entire fix while the arithmetic looked right.
+        return math.floor(1.0 / rate_threshold + 1e-9) + 1
+
     def _check_error_rates(self, error_rates, recent_errors) -> list[Recommendation]:
         recs = []
         recent_map = {e["node_id"]: e for e in recent_errors}
+        min_samples = self._min_samples_for_rate(self.ERROR_RATE_THRESHOLD_PCT / 100.0)
         for entry in error_rates:
             if entry["error_rate_pct"] < self.ERROR_RATE_THRESHOLD_PCT:
+                continue
+
+            # Too few requests for the percentage to mean anything -- one failure
+            # alone crosses the threshold below this many.  Report it, but as an
+            # observation about a small sample rather than an alarm about a rate.
+            if entry["total"] < min_samples:
+                recs.append(
+                    Recommendation(
+                        check_id="high_error_rate",
+                        severity=Severity.INFO,
+                        title=f"{entry['failed']} failure(s) on {entry['node_id']}",
+                        description=(
+                            f"{entry['failed']} of {entry['total']} requests failed on "
+                            f"{entry['node_id']} in the last 24h. That is "
+                            f"{entry['error_rate_pct']:.1f}%, but {entry['total']} "
+                            f"request(s) is too small a sample to call a rate — below "
+                            f"{min_samples} a single failure crosses the "
+                            f"{self.ERROR_RATE_THRESHOLD_PCT:.0f}% threshold on its own."
+                        ),
+                        fix=(
+                            f"Worth a look if it repeats, not an alarm yet. Low-traffic "
+                            f"backends sit here routinely: check what the failures were "
+                            f"with `sqlite3 ~/.fleet-manager/latency.db \"SELECT model, "
+                            f"status, error_message FROM request_traces WHERE node_id="
+                            f"'{entry['node_id']}' AND status!='completed' ORDER BY "
+                            f"timestamp DESC LIMIT 10\"`."
+                        ),
+                        node_id=entry["node_id"],
+                        data={
+                            "error_rate_pct": entry["error_rate_pct"],
+                            "failed": entry["failed"],
+                            "total": entry["total"],
+                            "min_samples": min_samples,
+                            "below_sample_floor": True,
+                        },
+                    )
+                )
                 continue
 
             recent = recent_map.get(entry["node_id"])
@@ -3052,7 +3126,12 @@ class HealthEngine:
 
     def _check_retry_rates(self, retry_stats) -> list[Recommendation]:
         recs = []
-        if retry_stats["total_requests"] == 0:
+        # Same floor, same reason: this is a fleet-wide average, so a tiny
+        # denominator only happens just after a restart -- which is exactly when
+        # one retry would read as a 33% retry rate.
+        if retry_stats["total_requests"] < self._min_samples_for_rate(
+            self.RETRY_RATE_THRESHOLD
+        ):
             return recs
         avg_retries = retry_stats["total_retries"] / retry_stats["total_requests"]
         if avg_retries >= self.RETRY_RATE_THRESHOLD:
