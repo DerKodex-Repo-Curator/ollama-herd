@@ -149,7 +149,7 @@ note implies.
 
 ---
 
-### `/v1/chat/completions` gets no context protection at all `OPEN` (2026-10-11)
+### `/v1/chat/completions` gets no context protection at all `FIXED` (2026-10-11)
 
 **Severity:** HIGH — it defeats the 0.11.0 `num_ctx` pin on an entire API
 surface, and it is the surface the context-window field report was about.
@@ -197,6 +197,28 @@ is already called there. One line, at the one place both formats converge.
 `RESPONSES` and `ANTHROPIC` take the first branch today, but a test should pin
 each surface's behaviour by format, because the bug is precisely that one format
 silently missed a call the others got.
+
+**Fixed 2026-10-11** exactly that way — one call added to the fallback branch,
+immediately before the `_apply_thinking_overhead` that was already there.
+Verified live: the same `/v1/chat/completions` request that produced **zero**
+context-protection actions now logs *"pinned num_ctx=32768 for
+glm-4.7-flash:latest"*. `glm` is resident at 32768/slot (~26.7 GB) rather than
+the 131072/slot and 48 GB the bypass produced.
+
+`tests/test_server/test_context_protection_every_format.py` parametrizes over
+all four formats — the only shape that would have caught a single format missing
+a call — and asserts the call happens **exactly once** per body build, so the
+fix cannot become a double-application.
+
+**A second footgun surfaced while writing those tests and is pinned rather than
+fixed:** `FLEET_NUM_CTX_OVERRIDES` is looked up with
+`overrides.get(model)` against the **normalized** model name, and
+`InferenceRequest` normalizes `glm-4.7-flash` to `glm-4.7-flash:latest`. So a
+bare key never matches, silently, and the model cold-loads at Ollama's default.
+This fleet's config happens to list both spellings, which is why it has never
+bitten here. Normalizing both sides of the lookup is a behaviour change that
+deserves its own commit — `TestOverrideKeyNormalization` documents the current
+behaviour so the change is deliberate when it happens.
 
 ---
 
@@ -802,7 +824,7 @@ is visible before changing anything.
 
 ---
 
-### Three health-engine tests fail when `test_streaming.py` runs first `OPEN`
+### Three health-engine tests fail when `test_streaming.py` runs first `FIXED` (2026-10-11)
 
 **Severity:** LOW (test-only) — but it is the kind that hides a real regression.
 
@@ -827,6 +849,16 @@ the actual cost of this one.
 pattern of individual tests clearing it at both ends and the rest not at all.
 Same hazard class as the CLI env-file import issue above: suite-order-dependent
 state that makes an unrelated change look guilty.
+
+**Fixed 2026-10-11** with exactly that fixture, clearing on both sides — before,
+so a test starts from a known state; after, so a test that *asserts* on events
+does not hand them to the next module.
+
+It went from latent to reliably red the same day:
+`test_context_protection_every_format.py` added 20 tests that each record
+events, and the full suite failed on those three. **That is the good outcome** —
+an order dependency that only bites sometimes is worse than one that always
+does. Verified in both orders and with the new file first: 1868 passing.
 
 ---
 

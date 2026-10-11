@@ -1553,6 +1553,29 @@ class StreamingProxy:
         if options:
             body["options"] = options
 
+        # Protect against num_ctx triggering expensive model reloads.
+        #
+        # **This branch is where OpenAI-format requests land**, and it was
+        # missing this call while the branch above had it.  The gate up there is
+        # ``original_format in (OLLAMA, ANTHROPIC, RESPONSES)``, and
+        # ``openai_compat`` sets ``RequestFormat.OPENAI`` -- so every
+        # ``/v1/chat/completions`` request got no override injection, no
+        # resident-context pin, no overflow detection and no strip/upgrade.
+        #
+        # Measured 2026-10-11 with ``glm-4.7-flash`` (configured 32768, no other
+        # callers): 0 context-protection actions via ``/v1/chat/completions``
+        # against 1 via ``/api/generate``.  A cold load over the OpenAI route
+        # came up at **131072/slot instead of 32768** and sat at **48 GB
+        # resident for a 19 GB model**.
+        #
+        # Fixed here rather than by adding OPENAI to the branch above, because
+        # that branch also assumes an Ollama-shaped ``raw_body`` whose
+        # generation params live under ``options`` -- OpenAI's are top-level,
+        # the same distinction ``mlx_proxy._to_openai_body`` has to make.  This
+        # is the point both formats converge on a body with an ``options`` dict,
+        # and ``_apply_thinking_overhead`` was already called here for exactly
+        # that reason.
+        self._apply_context_protection(body, request.model, node_id)
         # Auto-inflate num_predict for thinking models
         self._apply_thinking_overhead(body, request.model, node_id)
 

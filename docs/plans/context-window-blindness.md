@@ -1,5 +1,14 @@
 # Context-window blindness — truncation, unmanaged windows, and empty-completion misattribution
 
+> **Correction (2026-10-11).** This plan recorded the field report's root cause
+> as not reaching herd, because herd calls `/api/chat` downstream where an
+> OpenAI-format request has no `num_ctx` field. The downstream observation was
+> right and the inference was wrong: herd calls `/api/chat` but, for
+> OpenAI-format requests, **never added `num_ctx` at all** —
+> `_apply_context_protection` was only called on the OLLAMA/ANTHROPIC/RESPONSES
+> branch. So the reported failure mode did reach herd, by a different route than
+> the one dismissed here. Fixed; see `docs/issues.md`.
+
 **Status**: **IMPLEMENTED 2026-10-09**, except Phase 1 step 3, which is deliberately deferred until the trace field it depends on has produced calibration data. Deployed and verified live. Revised earlier the same day after a codebase audit that cut the plan roughly in half.
 
 **What landed:** `estimated_tokens` on the request, the trace and the schema; the pre-existing overflow detection in `routing.py` now persisted as an `overflow` event; `num_ctx_unmanaged`; `MlxServerInfo.context_length = None` as an explicit unknown; and `no_output` as a fourth `status` value folded into the existing `_check_stream_reliability` as `empty_generations`. 46 health checks, 1,773 tests.

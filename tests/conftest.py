@@ -25,6 +25,33 @@ from fleet_manager.server.registry import NodeRegistry
 
 
 @pytest.fixture(autouse=True)
+def _clear_context_protection_events():
+    """Reset the module-global context-protection event list between tests.
+
+    ``streaming._context_protection_events`` is a process-wide list that the
+    health engine reads to build ``context_protection_active`` and
+    ``context_protection_insufficient``.  Any test that builds an Ollama body
+    appends to it, so events leaked across *modules*: run
+    ``test_streaming.py`` before ``test_health_engine.py`` and three tests there
+    failed on events they never created, while each passed in isolation and the
+    full suite passed on whatever order pytest happened to pick.
+
+    Filed 2026-10-11 after reproducing it on unmodified main, and it went red
+    the same day when ``test_context_protection_every_format.py`` added 20 tests
+    that each record events -- a latent order dependency became a reliable
+    failure, which is the good outcome.
+
+    Clearing on both sides: before, so a test starts from a known state; after,
+    so a test that *asserts* on events does not hand them to the next module.
+    """
+    from fleet_manager.server import streaming
+
+    streaming._context_protection_events.clear()
+    yield
+    streaming._context_protection_events.clear()
+
+
+@pytest.fixture(autouse=True)
 def _clear_collector_ttl_caches():
     """Reset the per-heartbeat TTL caches between every test.
 
