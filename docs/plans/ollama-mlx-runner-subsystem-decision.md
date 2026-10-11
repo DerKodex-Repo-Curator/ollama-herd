@@ -1,7 +1,13 @@
 # Ollama's native MLX runner — deciding our MLX subsystem's fate
 
-**Status**: **NOT STARTED. Revised 2026-10-11 after a codebase + usage audit that
-reordered it.** This is Phase 5 of
+**Status**: **PHASE 2 DONE (2026-10-11). BLOCKED ON A DECISION, NOT ON WORK.**
+Phase 1's three sub-questions are 2-of-3 resolved — compaction answered (not a
+bug), the 33 GB question withdrawn as not real — leaving **one** open: does
+`GLM-4.7-Flash-MLX-4bit` justify itself at 26 requests in 86 days, given that
+GLM is ~4x too slow on Ollama (OPEN upstream)? If MLX is its only viable path,
+the plan resolves to **hold** and ends here. Phases 3–4 need **invest** *and* an
+idle machine. *Revised 2026-10-11 after a codebase + usage audit that reordered
+it.* This is Phase 5 of
 [`ollama-0.32-upgrade-and-mlx-evaluation.md`](ollama-0.32-upgrade-and-mlx-evaluation.md),
 executed 2026-07-17, which answered Q1–Q4 but deferred the subsystem decision.
 

@@ -1,6 +1,8 @@
 # One model, two runners — removing the ambiguity the `num_ctx` pin depends on
 
-**Status**: **NOT STARTED.** Filed as
+**Status**: **PHASE 1 DONE (2026-10-11); PHASES 2–4 NOT STARTED.** Phase 2 is
+the correctness fix this plan exists for — the `num_ctx` pin still takes a
+first-match answer when one name has two runners. Filed as
 [`docs/issues.md` → "One model resident twice makes 'the resident context'
 ambiguous, and the pin guesses"](../issues.md) on 2026-10-10, after observing it
 twice on the live fleet.
