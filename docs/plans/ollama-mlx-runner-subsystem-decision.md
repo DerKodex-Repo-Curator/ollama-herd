@@ -1,204 +1,218 @@
 # Ollama's native MLX runner — deciding our MLX subsystem's fate
 
-**Status**: **NOT STARTED.** This is Phase 5 of
+**Status**: **NOT STARTED. Revised 2026-10-11 after a codebase + usage audit that
+reordered it.** This is Phase 5 of
 [`ollama-0.32-upgrade-and-mlx-evaluation.md`](ollama-0.32-upgrade-and-mlx-evaluation.md),
-which was executed 2026-07-17 and answered Q1–Q4 but explicitly deferred the
-subsystem decision. It is written now because the answer that deferred it has
-changed.
+executed 2026-07-17, which answered Q1–Q4 but deferred the subsystem decision.
+
+> **The audit changed the question.** The plan's first draft asked whether
+> Ollama's MLX runner can replace `mlx_lm.server`. The trace DB says the prior
+> question is whether anything is using `mlx_lm.server` at all — and the answer
+> is essentially no. Everything below is reordered around that.
 
 ---
 
-## Why this plan exists now and not in July
+## What the audit found
 
-July's Q4 was the decisive question — Ollama's MLX **model coverage** — and the
-answer was that the question did not yet apply: *"MLX is NOT active. 0 `mlx` in a
-5 MB log; `ggml_metal_init`/`llama_model_loader` throughout. All gains are
-llama.cpp, MLX still dormant."* The strategic inversion recorded then was that
-Ollama's llama.cpp (77.8 tok/s) already beat our `mlx_lm.server` (59) **with
-Ollama's MLX switched off**, leaving distributed multi-Mac as the subsystem's
-only clear justification.
-
-Three things changed:
-
-1. **Ollama `0.40` makes MLX the default runner on Apple Silicon.** Selection is
-   per model via `IsMLX()`, which is exactly `ModelFormat == "safetensors"` — not
-   a flag, so there is nothing to switch on.
-2. **`/api/ps` now reports a `runner` field** (`llamacpp` / MLX) per loaded
-   model. July's Q4 had to be answered by grepping a 5 MB server log for `mlx`;
-   it is now a field in an API herd already calls on every heartbeat.
-3. **We are on `0.40.2`**, which arrived with a reboot on 2026-10-10 and was not
-   requested.
-
-So the decisive unknown is now cheaply measurable, and the subsystem it governs
-is large.
-
-## What is actually at stake
+### The usage data, which no earlier draft of this consulted
 
 | | |
 |---|---|
-| `node/mlx_supervisor.py` | 1,264 lines — spawn, health-check, auto-restart, memory gate, orphan reap, crash-rate quarantine, `mlx.launch` wrapping |
-| `server/mlx_proxy.py` | 1,596 lines — OpenAI↔Anthropic translation, per-URL client pool, reasoning-field surfacing |
-| `node/mlx_client.py` | 21 lines |
-| spread | `mlx` appears in **36 files** under `src/` |
-| tests | **203 of 1,804** (11%) are MLX-related |
-| ops | `scripts/setup-mlx.sh`, an exact `mlx-lm` pin that has broken on upgrades before, and the `--quantized-kv-start 0` workaround |
-| memory | two `mlx_lm.server` children at ~17 GB each |
+| MLX requests, all time | **2,816** |
+| Ollama requests, all time | **1,550,264** |
+| MLX share | **0.18%** |
+| of which the April evaluation burst (2026-W16) | **2,782 — 98.8%** |
+| MLX requests in the last 30 days | **1**, and it was `mlx:Definitely-Not-A-Real-Model-4bit`, a test |
 
-This is the largest optional subsystem in the project, and its premise is a
-claim about Ollama that is now five minor versions stale.
+Per currently-configured server:
 
-## What the audit changed
+| server | requests ever | last served |
+|---|---|---|
+| `Qwen3-Coder-30B-A3B-Instruct-4bit` (:11441, the compactor) | **207** | **2026-08-21** — 51 days ago |
+| `GLM-4.7-Flash-MLX-4bit` (:11442) | **26** | **2026-07-17** — 86 days ago |
 
-Three findings moved work out of this plan before it was written.
+Both are `status: healthy` and have been up 6h46m since the last reboot, holding
+**33.0 GB** resident (17.0 + 16.0, from `process_memory.children`).
 
-**The measurement is already one field away.** `/api/ps` returns `runner` and
-herd reads that endpoint every heartbeat, in exactly one place
-(`common/ollama_client.py:50`). Adding it to `LoadedModel` is the same one-site
-change that
-[`duplicate-runner-ambiguity.md`](duplicate-runner-ambiguity.md) needs for
-`digest`. **Do both in one edit; neither plan should do it alone.**
+**Context compaction, the canonical justification for the compactor, has never
+fired.** `FLEET_CONTEXT_COMPACTION_ENABLED=true` and
+`FLEET_CONTEXT_COMPACTION_MODEL` points at it, but every `compact` log line
+across every rotated file is the same startup line — *"Context Compactor enabled
+(default curator=…)"* — and the model has served nothing since August.
 
-**Two of our three MLX justifications are already settled in the repo and need
-no re-litigation.** Distributed multi-Mac (`mlx.launch`, `backend: ring`,
-`pipeline`) is ours — Ollama is single-host, documented in
-[`distributed-mlx-inference.md`](distributed-mlx-inference.md). And the
-compactor's `--draft-model` trade was measured on 2026-07-19 (84 of 2,813
-requests ever overlapped — 3%), so serialisation is not a cost for that
-workload. Do not re-measure either.
+So the standing cost is **2,881 lines** (`mlx_supervisor` 1,264, `mlx_proxy`
+1,596, `mlx_client` 21), `mlx` in **36 files**, **203 of 1,804 tests** (11%),
+8 test files, a brittle exact `mlx-lm` pin, the `--quantized-kv-start 0`
+workaround, `scripts/setup-mlx.sh`, and 33 GB of RAM — against 233 requests, none
+in seven weeks.
 
-**A feature gap is visible without running anything.** `strings` on the 0.40.2
-binary: `mlxrunner` appears **3,636** times, and draft/MTP/speculative strings
-are present — but **no `kv-bits`, `quantized-kv` or `kv_group_size` strings at
-all.** Our compactor runs `--kv-bits 8 --kv-group-size 64 --quantized-kv-start
-0`. If that absence holds up, the compactor cannot move as configured, which
-narrows the decision before a single model is pulled.
+**This is the technical-debt finding, and it is not a conclusion to act on
+blind.** 0.18% usage is a reason to ask what the subsystem is *for*, not proof
+that it is worthless: it may be dormant capability held deliberately (GLM tier,
+large-model headroom, distributed multi-Mac), in which case the cost is the
+premium and that should be stated rather than inferred. What it does rule out is
+spending effort on Phase 3-style feature parity before anyone has answered
+whether the workload exists.
+
+### What already exists, so the plan stops proposing it
+
+**herd already computes Ollama's own MLX predicate.** `ModelTagMeta.format` is
+populated from `/api/tags`, and `decode_parallelism_for` already branches on
+`meta.format == "safetensors"` — which *is* Ollama's `IsMLX()`. So "would Ollama
+run this model on MLX?" needs no new code and no model pulls. Measured today:
+
+```
+router /api/tags, 39 models:  gguf 27 | safetensors 1 | mlx 2 | onnx 3 | mflux 2 | diffusionkit 2 | '' 2
+```
+
+**Exactly one safetensors model exists on this fleet** — `x/z-image-turbo:latest`,
+an image model — and neither of our two MLX models is in Ollama at all; they are
+HF repos served by `mlx_lm.server`. That answers the old Phase 2 as written and
+narrows the real question to *importability*.
+
+**There is already a backend-naming convention; do not invent one.**
+`ollama_compat.py` synthesises `format="mlx"` for `mlx:`-prefixed models (lines
+306, 312, 502) and `fleet_headers(backend="mlx" if … else "ollama")` at line 1016.
+`is_mlx_model` / `strip_mlx_prefix` are the existing predicates.
+
+**Traces need no schema change to separate the backends.** `model LIKE 'mlx:%'`
+is sufficient — it is how the table above was produced. Do not add a `backend`
+column for this.
+
+**The measurement harness exists.** `benchmark_engine.py` has
+`discover_fleet`, `send_request`, `worker`, `warmup`, `percentile` and
+`build_report`, all driving the router rather than a backend, plus
+`benchmark_runner.py`. It has **zero** `mlx` references, so whether it can target
+`mlx:` models is itself a thing to check — but a comparison should extend it, not
+hand-roll curl loops.
+
+**The surfaces exist.** `mlx_backend_active` is already a health check, and the
+dashboard already has a "Node Models" section built to cover every backend. Any
+new reporting belongs there.
 
 ## Deliberately excluded
 
-- **Re-measuring distributed multi-Mac or the draft-model trade.** Settled, above.
-- **Deprecating anything in this plan.** This plan produces a decision and the
-  evidence for it. If the decision is to remove code, that is its own change
-  with its own tests — bundling them is how a measurement becomes a commitment
-  before it is a result.
-- **`OLLAMA_NEW_ENGINE`.** It no longer exists; Ollama deleted both CGO engines
-  in PR #16031. The July plan's "one untested lever" is gone.
-- **Chasing `glm-4.7-flash` performance.** Separate OPEN upstream issue.
+- **Re-measuring distributed multi-Mac** (`mlx.launch`, ring/pipeline) — ours,
+  Ollama is single-host, documented in
+  [`distributed-mlx-inference.md`](distributed-mlx-inference.md).
+- **Re-measuring the compactor's `--draft-model` trade** — settled 2026-07-19
+  (84 of 2,813 requests overlapped, 3%).
+- **`OLLAMA_NEW_ENGINE`** — deleted upstream in PR #16031; the var is gone.
+- **Any new `FLEET_*` toggle.** `FLEET_MLX_ENABLED` / `FLEET_NODE_MLX_ENABLED`
+  already exist and are legitimate — they gate spawning subprocesses, a side
+  effect outside herd. Nothing here needs a second switch, and a "new MLX path"
+  behind a flag is exactly the debt this project forbids.
+- **Deleting code in this plan.** This plan produces a decision and its evidence.
+  Removal is its own change with its own tests.
 
 ## Implementation principles
 
-- **Read-only until a phase says otherwise.** The July execution kernel-panicked
-  this box by letting a memory-heavy test fall through to a real load. Its rules
-  apply here verbatim: idle fleet, one measurement at a time, check
-  `memory_pressure` and `vm.swapusage` between each, and **a slow load is a stop
-  signal, not a curiosity**.
-- **One lever per window.** Do not upgrade Ollama, change herd and measure in the
+- **Read-only until a phase says otherwise.** July's execution kernel-panicked
+  this box; its rules apply verbatim — idle fleet, one measurement at a time,
+  check `memory_pressure` and `vm.swapusage` between each, and **a slow load is a
+  stop signal**.
+- **One lever per window.** Never upgrade Ollama, change herd, and measure in the
   same window.
-- **The null result is a result.** "Coverage is too narrow / the KV gap is real,
-  keep the subsystem" ends this plan successfully and should be recorded as
-  firmly as a decision to remove code.
+- **"Keep it" is a result.** Recorded as firmly as a decision to remove.
 
 ---
 
-## Phase 1 — Surface the runner herd is already told about
+## Phase 1 — Answer the workload question first, because it gates the rest
 
-Add `runner` and `digest` to `LoadedModel`, populate both at
-`common/ollama_client.py:50`, and show `runner` on the node card beside each
-loaded model. Shared with the duplicate-runner plan.
+No code. Decide, from the data above plus intent that only the operators hold:
 
-**Why first:** it converts the central question from a log-grep into fleet state,
-and it is the only code change in this plan's measurement phases. After it, "is
-this model on MLX?" is answerable for every model on every node, continuously,
-including on the MacBook Pro.
+1. Is either MLX server expected to serve traffic? Compaction is enabled and has
+   never fired — is that a bug to fix, a feature nobody needs, or a safety net
+   held for long sessions that have not occurred?
+2. Is `GLM-4.7-Flash-MLX-4bit` on :11442 serving a purpose at 26 requests in 86
+   days, given the OPEN upstream issue that GLM is ~4x too slow *on Ollama* —
+   i.e. is MLX the only viable GLM path, making this dormant-but-needed?
+3. Is 33 GB resident for dormant capability an acceptable premium on a 512 GB
+   box? (It is 6.4%. On the 128 GB MacBook Pro the same config would be 26%.)
 
-**Done when:** `/fleet/status` reports `runner` per loaded model, and the two
-current residents read `llamacpp` (both GGUF — this is the control, and if they
-read anything else the field's meaning is not what we think).
+**Done when** each of the three has a recorded answer. **If all three are "no",
+stop here** — the subsystem's fate is a deprecation question and Ollama's MLX
+coverage is irrelevant to it. Phases 2–4 exist only for a "yes".
 
-## Phase 2 — Establish coverage, which is the question that decides everything
+## Phase 2 — Surface what Ollama chose (shared, and worth doing regardless)
 
-For each model we currently serve via `mlx_lm.server`, determine whether Ollama
-can run it on MLX at all:
+Add `runner` and `digest` to `LoadedModel`, populate at
+`common/ollama_client.py:50` from `/api/ps`, show `runner` in the existing "Node
+Models" section. **Identical to Phase 1 of
+[`duplicate-runner-ambiguity.md`](duplicate-runner-ambiguity.md) — ship once.**
 
-1. Does a safetensors build exist in Ollama's registry, or can `ollama create`
-   import the MLX-community weights we already have on disk?
-2. Does `IsMLX()` select the MLX runner for it — i.e. does `/api/ps` report a
-   non-`llamacpp` runner after loading?
-3. Does it answer correctly through herd's existing OpenAI and Anthropic routes?
+Note this is *confirmation*, not the primary signal: `ModelTagMeta.format`
+already predicts the choice for every available model. `runner` reports what
+Ollama actually did for loaded ones, which is the check on that prediction.
 
-**Run on the MacBook Pro, not the Mac Studio.** The Studio serves this fleet's
-production traffic and holds 90 GB of resident models; a pull-and-load
-experiment there is exactly the shape of the July panic.
+**Done when** `/fleet/status` carries `runner` per loaded model and the two GGUF
+residents read `llamacpp` — the control, since anything else means the field does
+not mean what we think.
 
-**Done when:** each of our two MLX models is classified *runnable on Ollama-MLX*,
-*runnable only on llama.cpp*, or *not importable* — with the `/api/ps` `runner`
-value recorded for each.
+## Phase 3 — Importability, only if Phase 1 said yes
 
-## Phase 3 — Test the feature gap the binary already suggests
+The real coverage question, narrowed by the audit: can Ollama **import** the MLX
+weights we already have — `ollama create` from `mlx-community/…` safetensors —
+and does `format` then read `safetensors` so `IsMLX()` selects the MLX runner?
 
-Only for models Phase 2 classified as Ollama-MLX-runnable.
+Run on the **MacBook Pro**, not the Studio: the Studio serves this fleet's
+production traffic and holds 90 GB resident, which is the shape of the July panic.
 
-- **KV quantization.** The compactor depends on `--kv-bits 8`. Confirm whether
-  Ollama's MLX runner exposes any equivalent. The `strings` evidence says no;
-  confirm it properly before relying on it, because absence of a string is not
-  absence of a feature.
-- **Speculative decoding.** `draft-model` / `MTP` strings exist. Is it
-  configurable per model, or MTP-only for models that ship an MTP head? Our
-  compactor pairs Qwen3-Coder-30B with a Qwen3-1.7B draft and measures ~94 tok/s
-  with it.
-- **Concurrency.** Ollama's MLX runner decodes **one request at a time**
-  (`mlxrunner/runner.go` is a single loop), and `decode_parallelism_for` already
-  mirrors that per model. For the compactor this is free — 3% overlap, measured.
-  For GLM-4.7-Flash serving interactive traffic it is not, and that asymmetry
-  may split the decision per model rather than per subsystem.
+Then the feature gaps, which the binary already hints at — `strings` on 0.40.2
+shows `mlxrunner` **3,636** times with draft/MTP strings present but **no
+`kv-bits`, `quantized-kv` or `kv_group_size` strings at all**, and the compactor
+runs `--kv-bits 8 --kv-group-size 64 --quantized-kv-start 0`. Confirm properly;
+absence of a string is not absence of a feature. Also note Ollama's MLX runner
+decodes **one request at a time** (`mlxrunner/runner.go`), which
+`decode_parallelism_for` already mirrors — free for the compactor (3% overlap,
+measured), not free for interactive serving.
 
-**Done when:** each gap is confirmed-present, confirmed-absent, or
-irrelevant-to-our-use, with the evidence recorded.
+**Done when** each model is classified *importable and MLX-selected* /
+*importable but llama.cpp* / *not importable*, with gaps confirmed either way.
 
-## Phase 4 — Decide, per model, and write it down
-
-The decision space, which Phase 2–3 narrow rather than this plan choosing in
-advance:
+## Phase 4 — Decide, per model, and reconcile the docs
 
 | outcome | consequence |
 |---|---|
-| Ollama-MLX runs both models with acceptable gaps | Single-host `mlx_lm.server` becomes removable; **keep `mlx.launch` distributed** |
-| Runs one (likely GLM, not the compactor, if the KV gap is real) | Subsystem shrinks but stays; the `mlx:` prefix keeps earning its place |
-| Runs neither | Keep as-is, and record why so this is not re-opened for another five versions |
+| No workload (Phase 1 all "no") | Deprecation question; **keep `mlx.launch` distributed**, which Ollama cannot do |
+| Workload exists, Ollama covers it | Single-host `mlx_lm.server` becomes removable; keep distributed |
+| Workload exists, Ollama does not cover it (likely if the KV gap is real) | Keep, and record why so this is not reopened in another five versions |
 
-Whatever the outcome, two things are true and belong in the write-up: **routing
-remains the herd's value** — a faster Ollama improves the herd for free — and
-**distributed multi-Mac stays ours** regardless.
+Either way: **routing remains the herd's value** — a faster Ollama improves the
+herd for free — and **distributed multi-Mac stays ours**.
 
-**Done when:** `docs/issues.md`'s MLX-runner entry is resolved with a per-model
-verdict, and CLAUDE.md's `mlx:` gotcha states the current premise rather than the
-2026-07-17 one. The gotcha already carries a *"not re-measured since, and 0.40
-made MLX the default runner, so treat the comparison as stale rather than
-settled"* marker added 2026-10-11; this plan is what removes that marker.
+**Done when** `docs/issues.md`'s MLX-runner entry carries a per-model verdict and
+CLAUDE.md's `mlx:` gotcha states the current premise. That gotcha carries a
+*"not re-measured since, and 0.40 made MLX the default runner, so treat the
+comparison as stale rather than settled"* marker added 2026-10-11; this plan
+removes it.
 
 ---
 
 ## Order and dependencies
 
-Phase 1 is independent and useful on its own. Phase 2 gates Phase 3 (no point
-testing features of a runner that will not select). Phase 3 gates Phase 4. Phase
-1 ships with the duplicate-runner plan; Phases 2–4 need an idle machine and are
-the slow part.
+**Phase 1 gates 3 and 4 and needs no code** — it is a conversation with the data
+above. Phase 2 is independent, cheap, shared with the duplicate-runner plan, and
+worth shipping whatever Phase 1 concludes. Phase 3 needs an idle machine and is
+the slow part. Phase 4 follows 3.
 
 ## Open questions
 
-1. **Does `ollama create` accept MLX-community safetensors directly**, or does it
-   need a conversion step that changes the weights we have measured?
-2. **Is the Ollama version pinnable?** This subsystem's premise went stale
-   because Ollama auto-updated across five minors unrequested. The July plan
-   raised this and it is still open — and 0.40 arriving by reboot is the third
-   instance.
-3. **Does the MacBook Pro have the memory headroom** for Phase 2 at all (128 GB,
-   and the compactor model is ~17 GB resident)?
+1. **Why has compaction never fired?** Enabled since at least 2026-10-02 with a
+   curator configured. Either sessions never reach the trigger, or the trigger is
+   broken — and the second would be a real bug hiding behind an idle subsystem.
+2. **Does `ollama create` accept MLX-community safetensors directly**, or need a
+   conversion that changes the weights already measured?
+3. **Is the Ollama version pinnable?** This premise went stale because Ollama
+   auto-updated across five minors unrequested; 0.40 arriving by reboot is the
+   third instance. Raised in the July plan, still open.
+4. **Should the two idle servers keep running while this is decided?** 33 GB for
+   233 lifetime requests is the cheapest reversible lever on the board, and
+   `FLEET_NODE_MLX_SERVERS` already controls it with no code change.
 
 ## What this plan is not
 
-It is not a deprecation plan, and it does not assume the answer is "remove the
-subsystem". July's evidence pointed that way for single-host use and then Q4
-showed the question was premature; the honest position is that the premise is
-*unverified*, in both directions, and that a 2,881-line subsystem with 203 tests
-deserves a measurement before either keeping or cutting it.
+It is not a deprecation plan, and the usage data is not permission to delete
+2,881 lines. It is the case for asking what the subsystem is for *before*
+measuring whether a replacement exists — which is the opposite order from the
+draft the audit replaced.

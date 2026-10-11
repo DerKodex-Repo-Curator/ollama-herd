@@ -64,9 +64,13 @@ today — confirmed live, keys are `['context_length', 'details', 'digest',
 `common/ollama_client.py:50`. Step 1 is two fields and one edit, not a plumbing
 exercise.
 
-**`runner` arrives free in the same edit**, and it is the measurement that
-[`ollama-mlx-runner-subsystem-decision.md`](ollama-mlx-runner-subsystem-decision.md)
-is blocked on. **Ship step 1 once, for both plans.**
+**`runner` arrives free in the same edit**, and it is
+[`ollama-mlx-runner-subsystem-decision.md`](ollama-mlx-runner-subsystem-decision.md)'s
+Phase 2 verbatim. **Ship it once, for both plans.** Note that plan's audit found
+`ModelTagMeta.format` already predicts Ollama's runner choice for every
+*available* model (`format == "safetensors"` is `IsMLX()`), so `runner` on
+`LoadedModel` confirms what was actually chosen for *loaded* ones — the two are
+complementary, not duplicates.
 
 **There is already a shared-definition precedent to follow rather than invent.**
 `serializers.model_resident_on_node` was moved there precisely so the scorer and
