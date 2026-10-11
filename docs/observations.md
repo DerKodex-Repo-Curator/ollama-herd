@@ -382,6 +382,67 @@ Research revealed the mechanism: Ollama's scheduler calls `needsReload()` when `
 
 ---
 
+## 2026-10-10: An upgrade duplicated every resident model, and "is herd running?" was the only reason anyone looked
+
+**Context.** A reboot. The question asked was whether herd needed starting; it
+did not — the launchd agents had already brought it up, which is what they are
+for. The answer took four commands. Everything after that was found because
+those four commands print things next to each other.
+
+**Evidence.** Ollama had moved `0.35.1 → 0.40.2`, two minor versions, reboot-driven,
+nobody asked. The upgrade rewrote the manifest digest of both already-resident
+models a minute apart:
+
+```
+gemma3:27b     a418f5838eaf -> 8dda00f4f636   20:21:09
+gpt-oss:120b   a951a23b46a1 -> ad84bf7720de   20:22:01
+```
+
+A runner loaded before its rewrite keeps the old digest; the next request for
+that name resolves to the new one, which Ollama treats as a *different model*.
+So each model started a second runner on its first post-rewrite request, and
+`OLLAMA_KEEP_ALIVE=-1` meant neither copy would ever idle out:
+
+| | runners | resident |
+|---|---|---|
+| gemma3 duplicated | 3 | 114.0 GB |
+| then gpt-oss | 3 | 156.2 GB |
+| after clearing both | 2 | **89.8 GB** |
+
+**90 GB of waste, self-inflicted by an upgrade, invisible to every health check.**
+And `ollama stop <name>` removed the *current* digest and left the stale one —
+on both models. It takes two calls.
+
+**Insight — the valuable part.** The wasted memory is a footnote. What the
+duplicate exposed is that herd has no single answer to "what context is model M
+resident at on node N". `LoadedModel` carries no digest (the node reads it from
+`/api/ps` and drops it), so herd cannot tell two runners apart even in
+principle, and the ~15 call sites that resolve a name against `models_loaded`
+split three ways: first-match-wins (the `num_ctx` pin, the queue's size lookup,
+the upgrade search), `max()` (the context optimizer, `num_ctx_unmanaged`), and
+sums that double-count. Both live duplicates happened to agree on context, so
+the pin's first-match answer was right **by luck**. Simulated with the contexts
+differing — a manifest rewrite plus one unmanaged cold load — the pin sends
+131072 for a name whose other runner is at 32768, and which runner serves the
+request is Ollama's choice. That forces the reload the pin exists to prevent,
+intermittently, while looking like it works most of the time. Filed as OPEN.
+
+**And the reboot was a better test than anything I could construct.** The
+2026-10-09 `num_ctx` pin shipped with a stated gap: the cases I could not
+reproduce by hand were evictions, the heartbeat race, and preloader cold loads.
+A reboot is all three at once. The pin passed — both models came back at their
+configured per-slot contexts, which before the fix was impossible for more than
+one request. I had asked for wall-clock soak time; what the soak actually needed
+was an event, and the event arrived by itself.
+
+**Generalization for this fleet:** a version that changes on its own can change
+*data* and not just code. The existing rule is to re-check
+`curl -s localhost:11434/api/version` after any restart; it now needs a second
+line — **check `/api/ps` for duplicate names too**, because an upgrade that
+rewrites manifests silently doubles whatever was resident.
+
+---
+
 ## 2026-10-09: "Send nothing" is a decision, and it had been quietly reloading models for weeks
 
 **Context.** The `0.10.2` day-after check reported `gemma3:27b` resident at

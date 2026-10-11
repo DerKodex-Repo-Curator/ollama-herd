@@ -123,6 +123,119 @@ which on this fleet is 4x.
 
 ---
 
+### One model resident twice makes "the resident context" ambiguous, and the pin guesses `OPEN` (2026-10-10)
+
+**Severity:** MEDIUM — observed on the live fleet; the expensive half is
+reasoned from the code and a simulation, not yet witnessed.
+
+**Mechanism, confirmed on two models.** An Ollama upgrade can rewrite the
+manifest of a model that is *already resident*. `0.40.2` arrived with a reboot
+and rewrote both of this fleet's tags within a minute of each other:
+
+```
+gemma3:27b     a418f5838eaf -> 8dda00f4f636   modified 2026-10-10T20:21:09
+gpt-oss:120b   a951a23b46a1 -> ad84bf7720de   modified 2026-10-10T20:22:01
+```
+
+A runner loaded *before* its rewrite holds the old digest. The next request for
+that name resolves to the new digest, which Ollama treats as a different model —
+so it starts a **second runner for the same name**. With
+`OLLAMA_KEEP_ALIVE=-1` (`expires_at` year 2319) neither copy ever idles out.
+Both models did this, each exactly once, on their first post-rewrite request:
+
+```
+# gemma3 duplicated first (preloader cold-loaded it at 20:20:45, pre-rewrite)
+/api/ps   3 runners, 114.0 GB      gemma3:27b x2 (23.4 + 24.2), gpt-oss:120b
+# then gpt-oss, once something requested it
+/api/ps   3 runners, 156.2 GB      gpt-oss:120b x2 (66.4 + 66.4), gemma3:27b
+# after clearing both
+/api/ps   2 runners,  89.8 GB      one each, current digests, configured contexts
+```
+
+**So expect this after any Ollama upgrade that rewrites manifests:** every model
+resident across the upgrade doubles on its next request, and stays doubled.
+`backend_clients` was empty and `lsof` showed only herd's own router and node
+throughout — no co-tenant involved.
+
+**`ollama stop <name>` stopped the *current* digest and left the stale one** —
+the opposite of useful, on both models. A second `ollama stop` cleared it, after
+which one request through the router cold-loaded the current digest at its
+configured context. Net −24 GB on gemma3 and −66 GB on gpt-oss.
+
+**Why it matters beyond the wasted memory.** `LoadedModel` carries
+`name / size_gb / requests_active / parameter_size / quantization /
+context_length` — **no digest**. The node reads `/api/ps`, which has one, and
+drops it. So herd cannot tell the two runners apart even in principle, and the
+~15 call sites that resolve a name against `models_loaded` disagree about what
+to do with a duplicate:
+
+| call site | behaviour on a duplicate name |
+|---|---|
+| `streaming._get_loaded_context` | **first match wins** — this is the pin's input |
+| `streaming._find_context_upgrade` | first match (`break`) for `current_size` |
+| `queue_manager` model size | first match (`break`) |
+| `context_optimizer` allocated ctx | `max()` across entries |
+| `health_engine` `num_ctx_unmanaged` | `max()` across entries |
+| `health_engine` `num_ctx_override_inert` | one row **per entry** — names the same model twice |
+| `health_engine` `kv_cache_bloat` | `sum(size_gb)` — counts one model twice |
+| `health_engine` `underutilized_memory` | `len(models_loaded)` — 3 for 2 models |
+| `serializers` `models_loaded_count` / `free_slots` | a duplicate consumes an apparent slot |
+| anything building `{m.name for m in ...}` | collapses harmlessly |
+
+In both live instances the paired runners happened to agree on context
+(`gemma3` both 32768, `gpt-oss` both 131072), so nothing misbehaved — the pin's
+first-match answer was right by luck, not by construction. Simulating the same
+state with the contexts **differing** — which a manifest rewrite plus one
+unmanaged cold load produces — gives:
+
+```
+_get_loaded_context (first match)   -> 131072   <-- what the pin sends
+configured override                 ->  32768
+```
+
+Which runner serves a request is Ollama's choice. If it picks the 32768 one, a
+`num_ctx=131072` request **forces an unload/reload** — the precise failure the
+2026-10-09 pin exists to prevent, now triggered by the pin itself. First match
+is an arbitrary order, so this would be intermittent and would look like the
+pin working most of the time.
+
+**Proposed fix, in dependency order:**
+
+1. **Carry the digest.** Add it to `LoadedModel` and populate it in the
+   collector from `/api/ps`. Without it nothing below can be exact, and it is
+   already on the wire.
+2. **One definition of "the resident context for model M on node N",** beside
+   `model_resident_on_node` in `serializers.py` — the same reason that helper
+   was centralised. It must **refuse to guess**: when a name has several
+   runners at different contexts, return "unknown" so the pin passes through
+   untouched, matching the rule already in `_pin_resident_num_ctx` that an
+   unknown resident context asserts nothing. Agreeing contexts are unambiguous
+   and answer normally. Then route the pin, the upgrade search, the queue's
+   size lookup and the three checks through it, so they cannot drift.
+3. **Dedupe counts and sums** by digest (or by name where digest is absent):
+   `models_loaded_count`, `free_slots`, `kv_cache_bloat`'s totals,
+   `underutilized_memory`'s model count.
+4. **A check for the duplicate itself.** One logical model resident twice is
+   never intentional and is pure waste, and with `KEEP_ALIVE=-1` it cannot
+   resolve on its own — 66 GB sat stranded here until a human looked. It is
+   also cheap to detect once (1) lands: two `models_loaded` entries, one name,
+   two digests. The remediation is non-obvious enough to belong in the card:
+   `ollama stop <name>` **twice**, because the first call takes the current
+   digest, then one request through the router to cold-load with the override
+   applied.
+
+   Worth pairing with an existing signal: `models_loaded_count` jumping without
+   a corresponding cold-load trace is the same event seen from the router, and
+   `underutilized_memory` fires off that count.
+
+**Note this is a gap the 2026-10-09 fix created the conditions to notice, not
+one it introduced** — the ambiguity predates it; the pin is simply the first
+consumer whose correctness depends on the answer being unique. Found by acting
+on a routine "is herd running" check after a reboot, which is also how the
+`num_ctx` bug surfaced.
+
+---
+
 ### An absent `num_ctx` is not neutral, so the override could never survive one request `FIXED` (2026-10-09)
 
 **Severity:** HIGH — a per-model context setting had no lasting effect, and the
