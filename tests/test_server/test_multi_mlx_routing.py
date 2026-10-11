@@ -138,8 +138,24 @@ class TestMlxProxyUrlResolution:
 
         p = MlxProxy("http://127.0.0.1:11440", url_resolver=resolver)
         assert p._resolve_url("special/model") == "http://10.0.0.200:11441"
-        # No match → fallback to fixed
-        assert p._resolve_url("unknown/model") == "http://127.0.0.1:11440"
+        # No match → None, NOT the fixed URL.  This assertion was inverted until
+        # 2026-10-11: the fallback fired here and sent requests for unhosted
+        # models to whatever was listening on FLEET_MLX_URL's legacy default
+        # (localhost:11440).  On the reference fleet that produced 48 traced
+        # `404 Not Found` from http://127.0.0.1:11440 plus 15
+        # `All connection attempts failed` -- all blaming the network or a wrong
+        # server for "nothing serves this model".  Had :11440 hosted a different
+        # model, the request would have been answered by the wrong one.
+        assert p._resolve_url("unknown/model") is None
+
+    def test_model_agnostic_callers_still_get_the_fixed_url(self):
+        """`is_healthy` / `list_models` pass model_key=None and must keep working."""
+        p = MlxProxy("http://127.0.0.1:11440", url_resolver=lambda _m: None)
+        assert p._resolve_url(None) == "http://127.0.0.1:11440"
+
+    def test_true_legacy_deploy_has_no_resolver_and_still_works(self):
+        p = MlxProxy("http://127.0.0.1:11440")
+        assert p._resolve_url("anything/at/all") == "http://127.0.0.1:11440"
 
     def test_resolver_exception_falls_back_to_fixed(self):
         def bad_resolver(_model: str) -> str | None:

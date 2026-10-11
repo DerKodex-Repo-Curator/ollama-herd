@@ -25,6 +25,7 @@ from fleet_manager.server.mlx_proxy import (
     MlxModelMissingError,
     MlxQueueFullError,
     is_mlx_model,
+    no_mlx_server_reason,
     record_trace_mlx,
     strip_mlx_prefix,
 )
@@ -317,6 +318,19 @@ async def chat_completions(request: Request):
                         "type": "model_not_available",
                     }
                 },
+            )
+        # MLX is on, but is anything actually serving THIS model?  Answering here
+        # instead of letting the proxy fail means the client gets the cause
+        # rather than a transport error -- same reasoning as
+        # `_no_native_server` for native embeddings (docs/issues.md 2026-10-04).
+        _registry = request.app.state.registry
+        if _registry.resolve_mlx_url(model) is None:
+            reason, retryable = no_mlx_server_reason(_registry, model)
+            logger.warning(f"OpenAI 503: {reason}")
+            return JSONResponse(
+                status_code=503,
+                content={"error": {"message": reason, "type": "model_not_available"}},
+                headers={"Retry-After": "10"} if retryable else None,
             )
         return await _serve_openai_via_mlx(
             request=request, inference_req=inference_req, mlx_proxy=mlx_proxy, model=model,

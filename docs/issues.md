@@ -149,6 +149,40 @@ note implies.
 
 ---
 
+### `high_error_rate` has no minimum sample size, so three requests can trip a WARNING `OPEN` (2026-10-11)
+
+**Severity:** LOW-MEDIUM — a WARNING an operator cannot act on is how a board
+stops being read, and this is the **seventh** check in three weeks found firing
+on a state the system reaches legitimately.
+
+`_check_error_rates` gates only on `entry["error_rate_pct"] <
+ERROR_RATE_THRESHOLD_PCT`. There is no floor on `entry["total"]`, so any node
+with a handful of requests and one failure crosses it.
+
+**Demonstrated live 2026-10-11, by accident.** Two probe requests for an
+intentionally nonexistent MLX model, plus one real one, were all attributed to
+the `mlx-local` pseudo-node — the only node_id MLX traffic carries. That node's
+24 h window was **1 failed of 3 total = 33.3%**, and the card read *"33.3% error
+rate in the last 24h (1/3 requests failed)"* while the fleet as a whole was at
+**0.0%** across thousands of requests.
+
+The pseudo-node makes this easy to hit: `mlx-local` accumulates requests only
+when MLX is used, which on this fleet is rare (233 lifetime requests), so its
+denominator is almost always small enough for a single failure to dominate.
+
+**Proposed fix:** require a minimum denominator before the check can fire —
+enough that one failure cannot cross the threshold. With
+`ERROR_RATE_THRESHOLD_PCT` as it stands, that floor is `ceil(100 /
+threshold_pct)` requests at minimum, and a round number above it is clearer.
+Below the floor the honest severity is INFO or silence, not WARNING.
+
+**Check the adjacent ones for the same shape while fixing it:** any check
+dividing a failure count by a request count over a window is exposed to the same
+thing, and `mlx-local`'s small denominator is the general case for every
+low-traffic backend, not a quirk of this one.
+
+---
+
 ### One model resident twice makes "the resident context" ambiguous, and the pin guesses `OPEN` (2026-10-10)
 
 **Severity:** MEDIUM — observed on the live fleet; the expensive half is

@@ -47,6 +47,7 @@ from fleet_manager.server.mlx_proxy import (
     MlxWallClockTimeoutError,
     build_anthropic_non_streaming_response,
     is_mlx_model,
+    no_mlx_server_reason,
     openai_sse_to_anthropic_events,
     record_trace_mlx,
     strip_mlx_prefix,
@@ -936,6 +937,23 @@ async def messages(
                         ),
                     },
                 },
+            )
+        # MLX is on -- but is anything serving THIS model?  Classify here so the
+        # client gets the cause instead of a transport error, the same reasoning
+        # as `_no_native_server` for native embeddings (docs/issues.md
+        # 2026-10-04): that incident told a client to install software it already
+        # had, during a one-minute node restart, and lost the client.
+        _reg = request.app.state.registry
+        if _reg.resolve_mlx_url(local_model) is None:
+            reason, retryable = no_mlx_server_reason(_reg, local_model)
+            logger.warning(f"Anthropic[{rid}] 503: {reason}")
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "type": "error",
+                    "error": {"type": "overloaded_error", "message": reason},
+                },
+                headers={"Retry-After": "10"} if retryable else None,
             )
         logger.info(
             f"Anthropic[{rid}] MLX route: {body.model} → {local_model} "

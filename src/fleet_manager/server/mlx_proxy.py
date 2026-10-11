@@ -70,6 +70,89 @@ def is_mlx_model(model: str) -> bool:
     return model.startswith("mlx:")
 
 
+def no_mlx_server_reason(registry, model: str) -> tuple[str, bool]:
+    """Why no MLX server can take ``model``, and whether retrying can help.
+
+    The same shape and the same reason as
+    ``text_embedding_compat._no_native_server``: on 2026-10-04 a client was told
+    to install fastembed (already installed) during a one-minute node restart
+    and abandoned herd as unable to embed. An unroutable MLX model had the same
+    failure mode and a worse message -- ``All connection attempts failed``, or a
+    404 from whichever server happened to hold the legacy port.
+
+    Returns ``(message, retryable)``. Retryable means a node that *does* host the
+    model is merely away, so the caller should send ``Retry-After``.
+    """
+    from fleet_manager.models.node import NodeStatus
+
+    bare = strip_mlx_prefix(model)
+
+    def _hosts(node) -> bool:
+        return any(
+            getattr(s, "model", None) == bare
+            for s in (getattr(node, "mlx_servers", None) or [])
+        )
+
+    nodes = list(registry.get_all_nodes())
+    away = sorted(n.node_id for n in nodes if n.status == NodeStatus.OFFLINE and _hosts(n))
+    if away:
+        return (
+            f"The MLX server for '{bare}' runs on {', '.join(away)}, which is "
+            f"not online right now (restarting or offline). Retry shortly.",
+            True,
+        )
+    # Hosted by an online node, but not healthy yet -- supervisor still loading
+    # weights, memory-gated, or quarantined. All three resolve on their own.
+    unhealthy = sorted(
+        n.node_id
+        for n in nodes
+        if n.status != NodeStatus.OFFLINE
+        and any(
+            getattr(s, "model", None) == bare and getattr(s, "status", "") != "healthy"
+            for s in (getattr(n, "mlx_servers", None) or [])
+        )
+    )
+    if unhealthy:
+        return (
+            f"The MLX server for '{bare}' on {', '.join(unhealthy)} is configured "
+            f"but not healthy yet (loading weights, memory-gated, or quarantined). "
+            f"Check the mlx_server_down / mlx_memory_blocked health cards. Retry "
+            f"shortly.",
+            True,
+        )
+    if not registry.get_online_nodes():
+        return (
+            f"No node is online to serve '{bare}' right now. A restarting node "
+            f"re-registers within seconds; retry shortly.",
+            True,
+        )
+    return (
+        f"No node runs an MLX server for '{bare}'. Add it to "
+        f"FLEET_NODE_MLX_SERVERS on a node "
+        f'(e.g. \'[{{"model":"{bare}","port":11441}}]\') and restart herd-node. '
+        f"Models currently served: " + (_served_models(registry) or "none"),
+        False,
+    )
+
+
+def _served_models(registry) -> str:
+    """Comma-joined healthy MLX models across the fleet, for the error above.
+
+    Naming what *is* available is what turns "no server for X" from a dead end
+    into a correctable mistake -- usually a typo or a stale model id.
+    """
+    from fleet_manager.models.node import NodeStatus
+
+    names = sorted({
+        getattr(srv, "model", "")
+        for n in registry.get_all_nodes()
+        if n.status != NodeStatus.OFFLINE
+        for srv in (getattr(n, "mlx_servers", None) or [])
+        if getattr(srv, "status", "") == "healthy" and getattr(srv, "model", "")
+    })
+    return ", ".join(f"mlx:{n}" for n in names)
+
+
 def _ollama_messages_to_openai(messages: list[dict]) -> list[dict]:
     """Convert Ollama-shaped messages to strict OpenAI chat.completions shape.
 
@@ -484,23 +567,37 @@ class MlxProxy:
         """Translate a model key to the URL that hosts it.
 
         ``model_key`` is the bare model id (without the ``mlx:`` prefix).
-        Used by every request method before acquiring a client.  Returns
-        None only when the resolver is present AND returns no match AND
-        there's no fallback URL — in which case the caller raises a 503.
+        Used by every request method before acquiring a client.
+
+        **A resolver that answers "no node hosts this model" is authoritative —
+        do not fall back to the fixed URL.** The fallback used to fire here, and
+        it sent the request to whatever happened to be listening on the legacy
+        ``FLEET_MLX_URL`` default (``localhost:11440``). On this fleet that port
+        has no server, so requests for unconfigured MLX models produced **48
+        traced `404 Not Found` from `http://127.0.0.1:11440`** plus **15
+        `All connection attempts failed`** — every one of them blaming the
+        network or a wrong server for what was really "nothing serves this
+        model". Worse, had :11440 hosted a *different* model, the request would
+        have been answered by the wrong one.
+
+        The fixed URL still serves its real purpose: a genuine legacy
+        single-server deploy (no resolver at all), and the model-agnostic callers
+        (``is_healthy``, ``list_models``) that pass ``model_key=None``.
         """
         # Resolver wins when present; it reflects current heartbeat state.
         if self._url_resolver is not None and model_key is not None:
             try:
-                url = self._url_resolver(model_key)
+                return_url = self._url_resolver(model_key)
             except Exception as exc:  # noqa: BLE001
+                # A raising resolver is a bug on our side, not an answer about
+                # the model -- the fixed URL is a better guess than nothing.
                 logger.warning(
                     f"MlxProxy url_resolver({model_key!r}) raised "
                     f"{type(exc).__name__}: {exc}; falling back to fixed url"
                 )
-                url = None
-            if url:
-                return url.rstrip("/")
-        # Fall through to legacy single-URL config
+                return self._fixed_base_url
+            return return_url.rstrip("/") if return_url else None
+        # Legacy single-URL config, or a model-agnostic caller.
         return self._fixed_base_url
 
     async def _get_client_for(self, url: str) -> httpx.AsyncClient:

@@ -117,6 +117,7 @@ class HealthEngine:
         recommendations.extend(self._check_transcription(nodes))
         recommendations.extend(self._check_connection_failures(nodes))
         recommendations.extend(self._check_mlx_backend(nodes))
+        recommendations.extend(self._check_mlx_routing_disabled(nodes))
         recommendations.extend(self._check_vision_backend_missing(nodes))
         recommendations.extend(self._check_mapped_models_hot(nodes))
         recommendations.extend(self._check_anthropic_no_chat_model(nodes))
@@ -191,6 +192,10 @@ class HealthEngine:
             recommendations.extend(self._check_retry_rates(retry_stats))
 
             # Context waste analysis
+            mlx_counts = await trace_store.get_request_count_by_model(seconds=86400)
+            recommendations.extend(
+                self._check_mlx_requests_unservable(nodes, mlx_counts)
+            )
             prompt_stats = await trace_store.get_prompt_token_stats(days=7)
             recommendations.extend(
                 self._check_context_waste(prompt_stats, nodes)
@@ -1844,6 +1849,131 @@ class HealthEngine:
     # ------------------------------------------------------------------
     # MLX backend checks (Phase 5 of docs/plans/mlx-backend-for-large-models.md)
     # ------------------------------------------------------------------
+
+    def _check_mlx_routing_disabled(self, nodes) -> list[Recommendation]:
+        """A node is running MLX servers the router will never route to.
+
+        ``FLEET_NODE_MLX_ENABLED`` (node) and ``FLEET_MLX_ENABLED`` (router) are
+        separate switches, and the router only builds ``MlxProxy`` when its own
+        is true (``app.py``). Set one without the other and the node spawns
+        ``mlx_lm.server`` subprocesses, loads their weights, reports them
+        healthy -- and every ``mlx:`` request gets a 503 saying the backend is
+        disabled. On the reference fleet two such servers hold **33 GB**.
+
+        Nothing else surfaces this: ``mlx_backend_active`` fires INFO on exactly
+        the same state, because from the node's side it *is* active.
+
+        What does it fire on when everything is working? Nothing -- both flags
+        set is the working case, and neither set means no servers to report.
+        """
+        import os
+
+        raw = os.environ.get("FLEET_MLX_ENABLED", "").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            return []
+
+        stranded: list[dict] = []
+        for node in nodes:
+            if node.status.value == "offline":
+                continue
+            for srv in getattr(node, "mlx_servers", None) or []:
+                stranded.append({
+                    "node_id": node.node_id,
+                    "model": getattr(srv, "model", ""),
+                    "port": getattr(srv, "port", 0),
+                    "status": getattr(srv, "status", ""),
+                })
+        if not stranded:
+            return []
+
+        names = ", ".join(f"{m['model']} (:{m['port']})" for m in stranded)
+        return [
+            Recommendation(
+                check_id="mlx_routing_disabled",
+                severity=Severity.WARNING,
+                title=f"{len(stranded)} MLX server(s) running but unroutable",
+                description=(
+                    f"These nodes are running mlx_lm.server subprocesses, but the "
+                    f"router has FLEET_MLX_ENABLED unset or false, so it never "
+                    f"builds the MLX proxy and every `mlx:` request returns 503. "
+                    f"The subprocesses still hold their model weights in memory. "
+                    f"Running: {names}."
+                ),
+                fix=(
+                    "Either set FLEET_MLX_ENABLED=true on the router and restart "
+                    "herd, or stop paying for the memory: remove the entries from "
+                    "FLEET_NODE_MLX_SERVERS and restart herd-node. The two "
+                    "switches are deliberately separate -- the node's spawns "
+                    "subprocesses, the router's enables routing -- so one without "
+                    "the other is always a mistake in one direction or the other."
+                ),
+                data={"servers": stranded},
+            )
+        ]
+
+    def _check_mlx_requests_unservable(
+        self, nodes, mlx_request_counts: dict[str, int] | None = None
+    ) -> list[Recommendation]:
+        """Traffic is arriving for an ``mlx:`` model nothing healthy serves.
+
+        Until 2026-10-11 these requests were sent to whatever was listening on
+        ``FLEET_MLX_URL``'s legacy default (``localhost:11440``) and failed with
+        ``404 Not Found`` or ``All connection attempts failed`` -- 63 traced
+        instances on this fleet, every one blaming the network or a wrong server.
+        The route now returns a classified 503 (``no_mlx_server_reason``); this
+        makes the condition visible without waiting for a client to complain.
+
+        What does it fire on when everything is working? Nothing -- a served
+        ``mlx:`` model resolves to a healthy server and is skipped. It needs both
+        traffic *and* the absence of a server, which is a misconfiguration or a
+        stale model id by construction.
+        """
+        if not mlx_request_counts:
+            return []
+        from fleet_manager.server.mlx_proxy import is_mlx_model, strip_mlx_prefix
+
+        healthy: set[str] = {
+            getattr(srv, "model", "")
+            for node in nodes
+            if node.status.value != "offline"
+            for srv in (getattr(node, "mlx_servers", None) or [])
+            if getattr(srv, "status", "") == "healthy"
+        }
+        unservable = {
+            model: n
+            for model, n in mlx_request_counts.items()
+            if is_mlx_model(model) and strip_mlx_prefix(model) not in healthy
+        }
+        if not unservable:
+            return []
+
+        lines = ", ".join(
+            f"{m} ({n} request{'s' if n != 1 else ''})"
+            for m, n in sorted(unservable.items(), key=lambda kv: -kv[1])
+        )
+        served = ", ".join(f"mlx:{m}" for m in sorted(healthy) if m) or "none"
+        total = sum(unservable.values())
+        return [
+            Recommendation(
+                check_id="mlx_requests_unservable",
+                severity=Severity.WARNING if total > 1 else Severity.INFO,
+                title=f"{len(unservable)} MLX model(s) requested with no server",
+                description=(
+                    f"Requests arrived in the last 24h for MLX models that no "
+                    f"healthy mlx_lm.server hosts: {lines}. Each one fails. "
+                    f"Currently served: {served}."
+                ),
+                fix=(
+                    "Usually a stale or mistyped model id -- compare against the "
+                    "served list above. Otherwise add it to FLEET_NODE_MLX_SERVERS "
+                    "on a node and restart herd-node. A single request is rated "
+                    "INFO because a one-off probe of a wrong name is not a fault; "
+                    "repeat traffic means a client is configured against a model "
+                    "this fleet does not serve."
+                ),
+                data={"unservable": unservable, "served": sorted(healthy)},
+            )
+        ]
 
     def _check_mlx_backend(self, nodes) -> list[Recommendation]:
         """Check that nodes advertising MLX models have the backend reachable.
