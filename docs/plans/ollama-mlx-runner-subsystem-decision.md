@@ -5,16 +5,20 @@ reordered it.** This is Phase 5 of
 [`ollama-0.32-upgrade-and-mlx-evaluation.md`](ollama-0.32-upgrade-and-mlx-evaluation.md),
 executed 2026-07-17, which answered Q1–Q4 but deferred the subsystem decision.
 
-> **The audit changed the question.** The plan's first draft asked whether
-> Ollama's MLX runner can replace `mlx_lm.server`. The trace DB says the prior
-> question is whether anything is using `mlx_lm.server` at all — and the answer
-> is essentially no. Everything below is reordered around that.
+> **The audit changed the question twice.** The first draft asked whether
+> Ollama's MLX runner can replace `mlx_lm.server`. A usage audit of our own trace
+> DB suggested the prior question was whether *anything* uses `mlx_lm.server`.
+> That inference was then corrected: **this is an open-source project, and one
+> fleet's usage measures our cost, not the subsystem's value.** The decision
+> needs community evidence, which — it turns out — the project already collects.
+> Both are below, kept separate, because conflating them is the mistake this
+> section exists to not repeat.
 
 ---
 
 ## What the audit found
 
-### The usage data, which no earlier draft of this consulted
+### Our fleet's usage — which measures OUR cost, and nothing else
 
 | | |
 |---|---|
@@ -46,13 +50,69 @@ So the standing cost is **2,881 lines** (`mlx_supervisor` 1,264, `mlx_proxy`
 workaround, `scripts/setup-mlx.sh`, and 33 GB of RAM — against 233 requests, none
 in seven weeks.
 
-**This is the technical-debt finding, and it is not a conclusion to act on
-blind.** 0.18% usage is a reason to ask what the subsystem is *for*, not proof
-that it is worthless: it may be dormant capability held deliberately (GLM tier,
-large-model headroom, distributed multi-Mac), in which case the cost is the
-premium and that should be stated rather than inferred. What it does rule out is
-spending effort on Phase 3-style feature parity before anyone has answered
-whether the workload exists.
+**That is a statement about our maintenance burden, and it is the only thing
+this data supports.** It is not evidence the subsystem is unused — a single
+fleet cannot show that, and reasoning from it to the project would be exactly
+the recency-and-availability error that produced the first draft.
+
+### The community's usage — which is the question that matters for an OSS project
+
+The project already collects this: `community_telemetry.py` sends one anonymous
+payload per herd per day, default-on, with per-model `entries` carrying a raw
+`model` name (`model[:160]` in `anonymous_rollup.py`), so an `mlx:` prefix
+survives intact. `GET https://ollamaherd.com/api/v1/stats` returns the
+aggregate. Measured 2026-09-11 → 2026-10-11:
+
+| | |
+|---|---|
+| active installs | **20** |
+| active devices | **51** |
+| total requests | **308,830** |
+| requests on `mlx:`-prefixed models | **0** |
+
+The `items` list is capped at 25 entries and its lowest is **14 requests**, so
+any `mlx:` usage above roughly 14 requests/30d *would* appear. The absence is
+real down to a low floor.
+
+**Three reasons that is weaker evidence than it looks, and they matter:**
+
+1. **The sample is dominated by us.** The top three models are 295,310 of
+   308,830 requests (95.6%) and each appears in just **2 herds** — ours is one.
+   The other ~18 installs account for roughly **13,520 requests** between them.
+   Absence of `mlx:` in a 13.5k-request sample across 18 installs is thin.
+2. **Telemetry is opt-outable**, and we cannot know whether MLX operators opt out
+   at a different rate.
+3. **20 active installs against ~464 downloads/week** means most installs are not
+   in this picture at all.
+
+**One signal pointing the other way, which nearly got missed:**
+`qwen3.8:27b-mlx` — **51 requests across 2 herds**. That is an MLX model served
+**through Ollama** (no `mlx:` prefix, so it routed to Ollama), not through our
+subsystem. Weak, but it is direct evidence that *someone else* runs MLX, and that
+the path they use is Ollama's native runner. That supports the strategic question
+independently of what we do with our own code.
+
+### The asymmetry that should govern the decision
+
+Our MLX subsystem is **opt-in** — `mlx_enabled: bool = False` on both
+`ServerSettings` and `NodeSettings` — so every user of it turned it on
+deliberately. It is also **published surface**, not an internal detail:
+`docs/guides/mlx-setup.md`, **9 of 37** ClawHub skills, the README, and 20
+mentions in the configuration reference.
+
+So the costs are not symmetric. Not investing further costs us nothing. Removing
+it breaks a deliberate, documented configuration for users we cannot see, and the
+telemetry gives a **floor** on their number, never a zero. For an open-source
+project that is three distinct decisions, and the plan should not collapse them:
+
+| | meaning |
+|---|---|
+| **Invest** | make Ollama-native MLX a first-class path; possibly retire ours after |
+| **Hold** | keep it working, stop extending it, stop paying for parity measurements |
+| **Deprecate** | announce, give a release of warning, provide a migration — never a silent removal |
+
+What the data *does* rule out is spending effort on Phase 3-style feature parity
+before someone has chosen among those three.
 
 ### What already exists, so the plan stops proposing it
 
@@ -117,22 +177,46 @@ new reporting belongs there.
 
 ---
 
-## Phase 1 — Answer the workload question first, because it gates the rest
+## Phase 1 — Choose invest / hold / deprecate, which gates the rest
 
-No code. Decide, from the data above plus intent that only the operators hold:
+No code. Two separable questions, and only the operators hold the second.
 
-1. Is either MLX server expected to serve traffic? Compaction is enabled and has
-   never fired — is that a bug to fix, a feature nobody needs, or a safety net
-   held for long sessions that have not occurred?
-2. Is `GLM-4.7-Flash-MLX-4bit` on :11442 serving a purpose at 26 requests in 86
-   days, given the OPEN upstream issue that GLM is ~4x too slow *on Ollama* —
-   i.e. is MLX the only viable GLM path, making this dormant-but-needed?
-3. Is 33 GB resident for dormant capability an acceptable premium on a 512 GB
-   box? (It is 6.4%. On the 128 GB MacBook Pro the same config would be 26%.)
+**1a — What does the community actually do?** Partly answerable now, and worth
+improving before deciding:
 
-**Done when** each of the three has a recorded answer. **If all three are "no",
-stop here** — the subsystem's fate is a deprecation question and Ollama's MLX
-coverage is irrelevant to it. Phases 2–4 exist only for a "yes".
+- The `/api/v1/stats` aggregate shows **0** `mlx:` requests across 20 installs,
+  real to a ~14 req/30d floor — but with our fleet at 95.6% of the sample, the
+  evidence outside us covers only ~13,520 requests.
+- **Widen it cheaply before concluding.** The stats endpoint caps `items` at 25;
+  a server-side count of *distinct herds reporting any* `mlx:` model, or of
+  installs with `mlx_enabled`, would answer this far better than a request-share
+  ranking and needs no client change. That is a question for the service, not
+  herd.
+- `qwen3.8:27b-mlx` in 2 herds says someone runs MLX **through Ollama**. Whether
+  that is the direction to support is Phase 3's question.
+
+**1b — What is our own dormant capability for?**
+
+1. Compaction is enabled and has **never fired**. Bug, unused feature, or a
+   safety net for long sessions that have not occurred? Only the first is work.
+2. Does `GLM-4.7-Flash-MLX-4bit` justify itself at 26 requests in 86 days, given
+   the OPEN upstream issue that GLM is ~4x too slow **on Ollama**? If MLX is the
+   only viable GLM path, this is dormant-but-needed, which is a keep.
+3. Is 33 GB for dormant capability an acceptable premium? It is 6.4% of this
+   512 GB box — and **26% of the 128 GB MacBook Pro**, which is the shape most
+   community installs have (18 of 20 herds run 1–2 machines).
+
+**Done when** the outcome is recorded as **invest**, **hold** or **deprecate**,
+with the reason.
+
+- **Hold** is the cheapest and is the default if 1b has no clear answer: stop
+  extending, keep it working, skip Phases 3–4 entirely. Nothing breaks for
+  anyone.
+- **Deprecate** does *not* mean delete in this plan. It means an announced path:
+  a release that warns, a documented migration to Ollama-native MLX, and removal
+  no earlier than the release after. The subsystem is opt-in and documented in
+  9 of 37 skills; a silent removal is not available.
+- **Invest** is the only outcome that needs Phases 3–4.
 
 ## Phase 2 — Surface what Ollama chose (shared, and worth doing regardless)
 
@@ -149,7 +233,7 @@ Ollama actually did for loaded ones, which is the check on that prediction.
 residents read `llamacpp` — the control, since anything else means the field does
 not mean what we think.
 
-## Phase 3 — Importability, only if Phase 1 said yes
+## Phase 3 — Importability, only if Phase 1 chose *invest*
 
 The real coverage question, narrowed by the audit: can Ollama **import** the MLX
 weights we already have — `ollama create` from `mlx-community/…` safetensors —
@@ -174,9 +258,9 @@ measured), not free for interactive serving.
 
 | outcome | consequence |
 |---|---|
-| No workload (Phase 1 all "no") | Deprecation question; **keep `mlx.launch` distributed**, which Ollama cannot do |
-| Workload exists, Ollama covers it | Single-host `mlx_lm.server` becomes removable; keep distributed |
-| Workload exists, Ollama does not cover it (likely if the KV gap is real) | Keep, and record why so this is not reopened in another five versions |
+| Ollama covers our models | Ollama-native MLX becomes the documented path; **ours enters the announced deprecation above**, never a silent removal — and **`mlx.launch` distributed stays**, which Ollama cannot do |
+| Ollama does not cover them (likely if the KV gap is real) | Keep, and record why, so this is not reopened in another five versions |
+| Mixed per model | The `mlx:` prefix keeps earning its place for the gap models only |
 
 Either way: **routing remains the herd's value** — a faster Ollama improves the
 herd for free — and **distributed multi-Mac stays ours**.
@@ -192,7 +276,8 @@ removes it.
 ## Order and dependencies
 
 **Phase 1 gates 3 and 4 and needs no code** — it is a conversation with the data
-above. Phase 2 is independent, cheap, shared with the duplicate-runner plan, and
+above, and *hold* is a legitimate terminal state that skips everything after
+Phase 2. Phase 2 is independent, cheap, shared with the duplicate-runner plan, and
 worth shipping whatever Phase 1 concludes. Phase 3 needs an idle machine and is
 the slow part. Phase 4 follows 3.
 
@@ -212,7 +297,15 @@ the slow part. Phase 4 follows 3.
 
 ## What this plan is not
 
-It is not a deprecation plan, and the usage data is not permission to delete
-2,881 lines. It is the case for asking what the subsystem is for *before*
-measuring whether a replacement exists — which is the opposite order from the
-draft the audit replaced.
+It is not a deprecation plan, and **the usage data is not permission to delete
+2,881 lines.** Two corrections are worth carrying forward, because both were
+made during the writing of this plan rather than after:
+
+1. The first draft measured feature parity before asking whether the workload
+   existed.
+2. The second draft answered "does the workload exist" from **our fleet alone**,
+   in an open-source project with ~464 downloads/week. One fleet's traffic is a
+   cost measurement, not a usage measurement. The community aggregate is thin and
+   dominated by us, so it establishes a floor on unseen usage and never a zero —
+   and an opt-in, documented capability used by anyone at all is removed on
+   notice, not on a percentage.
