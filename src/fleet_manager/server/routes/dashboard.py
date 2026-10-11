@@ -213,6 +213,10 @@ async def dashboard_events(request: Request):
                                 "parameter_size": m.parameter_size,
                                 "quantization": m.quantization,
                                 "context_length": m.context_length,
+                                # Which runner Ollama chose. 0.40 makes MLX the
+                                # default on Apple Silicon and decides per model,
+                                # so "served by Ollama" is no longer one thing.
+                                "runner": m.runner,
                             }
                             for m in node.ollama.models_loaded
                         ],
@@ -2389,7 +2393,14 @@ function renderNodes(nodes) {
       const typeClass = (nm.includes('embed') || nm.includes('nomic') || nm.includes('bge')) ? 'embed'
         : (nm.includes('image') || nm.includes('flux') || nm.includes('diffusion') || nm.startsWith('x/') || nm.startsWith('sd')) ? 'image'
         : (nm.includes('asr') || nm.includes('whisper')) ? 'stt' : '';
-      return `<span class="model-chip ${typeClass} hot">${m.name} <span class="size">${meta}${ctx}</span><span class="size" style="opacity:0.6;margin-left:4px">ollama</span></span>`;
+      // The backend label was hardcoded "ollama". Since 0.40 Ollama picks a
+      // runner per model (MLX by default on Apple Silicon, llama.cpp for GGUF),
+      // so name the runner when it is NOT the llama.cpp default -- surfacing the
+      // exception rather than tagging every chip with its own default. Empty
+      // runner means pre-0.40 Ollama or an older node agent: say "ollama", as before.
+      const rn = m.runner || '';
+      const backendLabel = (rn && rn !== 'llamacpp') ? 'ollama/' + rn : 'ollama';
+      return `<span class="model-chip ${typeClass} hot">${m.name} <span class="size">${meta}${ctx}</span><span class="size" style="opacity:0.6;margin-left:4px">${backendLabel}</span></span>`;
     });
     const mlxChips = mlxLoaded.map(m => {
       // Strip mlx: prefix and the org/ part for a shorter label

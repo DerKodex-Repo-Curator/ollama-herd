@@ -182,7 +182,8 @@ new reporting belongs there.
 No code. Two separable questions, and only the operators hold the second.
 
 **1a — What does the community actually do?** Partly answerable now, and worth
-improving before deciding:
+improving before deciding. *(Progress 2026-10-11: the aggregate below was
+measured; widening it remains a service-side question.)*
 
 - The `/api/v1/stats` aggregate shows **0** `mlx:` requests across 20 installs,
   real to a ~14 req/30d floor — but with our fleet at 95.6% of the sample, the
@@ -197,8 +198,22 @@ improving before deciding:
 
 **1b — What is our own dormant capability for?**
 
-1. Compaction is enabled and has **never fired**. Bug, unused feature, or a
-   safety net for long sessions that have not occurred? Only the first is work.
+1. ~~Compaction is enabled and has **never fired**. Bug, unused feature, or a
+   safety net for long sessions that have not occurred? Only the first is
+   work.~~ **ANSWERED 2026-10-11 — not a bug.** Compaction fires above
+   `context_compaction_budget_tokens`, default **20,000**, unset on this fleet.
+   Across **1,504,192** traced requests with a prompt count, only **87** ever
+   reached 20K — 0.006% — and on `gpt-oss:120b` (1.38M requests) exactly
+   **two** did. The threshold is simply never crossed, so this is the third
+   option: a safety net for sessions that have not occurred.
+
+   **But note which requests crossed it**, because it cuts against deprecation:
+   17 of the 87 were `mlx:mlx-community/Qwen3-Coder-Next-4bit` (max prompt
+   **129,159**) and 62 more were `qwen3-coder:30b` / `-agent` (max 62,227).
+   When this fleet was doing heavy agentic coding, prompts *did* exceed the
+   budget — on the MLX path. The capability was relevant to a real workload;
+   that workload is simply not the current one. An argument for **hold**, not
+   for removal.
 2. Does `GLM-4.7-Flash-MLX-4bit` justify itself at 26 requests in 86 days, given
    the OPEN upstream issue that GLM is ~4x too slow **on Ollama**? If MLX is the
    only viable GLM path, this is dormant-but-needed, which is a keep.
@@ -218,20 +233,32 @@ with the reason.
   9 of 37 skills; a silent removal is not available.
 - **Invest** is the only outcome that needs Phases 3–4.
 
-## Phase 2 — Surface what Ollama chose (shared, and worth doing regardless)
+## Phase 2 — Surface what Ollama chose (shared, and worth doing regardless) — ✅ DONE 2026-10-11
 
-Add `runner` and `digest` to `LoadedModel`, populate at
-`common/ollama_client.py:50` from `/api/ps`, show `runner` in the existing "Node
-Models" section. **Identical to Phase 1 of
-[`duplicate-runner-ambiguity.md`](duplicate-runner-ambiguity.md) — ship once.**
+Added `runner` and `digest` to `LoadedModel`, populated at the single
+construction site `common/ollama_client.py`, and the node card's **existing**
+backend label — previously the hardcoded string `ollama` — now names the runner
+when it is not the `llamacpp` default. Surfacing the exception rather than
+tagging every chip with its own default, matching how `kv_cache_bloat` prints
+"vs configured" only on a mismatch. No new dashboard section, no new field on the
+wire beyond the two, no toggle.
 
-Note this is *confirmation*, not the primary signal: `ModelTagMeta.format`
-already predicts the choice for every available model. `runner` reports what
-Ollama actually did for loaded ones, which is the check on that prediction.
+**Also Phase 1 of [`duplicate-runner-ambiguity.md`](duplicate-runner-ambiguity.md)
+— shipped once, for both.**
 
-**Done when** `/fleet/status` carries `runner` per loaded model and the two GGUF
-residents read `llamacpp` — the control, since anything else means the field does
-not mean what we think.
+This is *confirmation*, not the primary signal: `ModelTagMeta.format` already
+predicts the choice for every available model via the same `safetensors` test
+Ollama's `IsMLX()` uses. `runner` reports what Ollama actually *did* for loaded
+ones, so a divergence between the two means our model of its selection is wrong
+— and that model drives `decode_parallelism_for`.
+
+**Verified live.** Both residents report `runner=llamacpp` in `/fleet/status`,
+matching Ollama's own `/api/ps` and the `format=gguf` prediction — the control
+held, so the field means what we think. Both fields default to `""`, so a
+pre-0.40 Ollama and an older node agent are unaffected; six tests in
+`tests/test_models/test_loaded_model_runner_digest.py` pin that, including the
+real captured 0.40.2 payload and a test that `runner` is never confused with
+herd's own `mlx:` routing prefix.
 
 ## Phase 3 — Importability, only if Phase 1 chose *invest*
 

@@ -53,6 +53,11 @@ class OllamaClient:
                         parameter_size=details.get("parameter_size", ""),
                         quantization=details.get("quantization_level", ""),
                         context_length=m.get("context_length", 0),
+                        # Both new in the 0.40 /api/ps payload and previously
+                        # dropped on the floor here.  See LoadedModel for why
+                        # each matters; this is the only place either is read.
+                        runner=m.get("runner", ""),
+                        digest=m.get("digest", ""),
                     )
                 )
             return models

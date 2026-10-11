@@ -86,6 +86,25 @@ class LoadedModel(BaseModel):
     parameter_size: str = ""  # e.g. "30.5B"
     quantization: str = ""  # e.g. "Q4_K_M"
     context_length: int = 0  # allocated context window
+    # Which runner Ollama actually chose for this model -- "llamacpp", or an MLX
+    # runner on Apple Silicon.  Ollama 0.40 makes MLX the default there and
+    # decides per model via ``IsMLX()``, which is exactly
+    # ``ModelFormat == "safetensors"``; `/api/tags` metadata therefore *predicts*
+    # the choice (``ModelTagMeta.format``, already used by
+    # ``decode_parallelism_for``) while this field reports what was *done*.
+    # Keeping both is the point: a divergence means our model of Ollama's
+    # selection is wrong, and that model drives decode-parallelism math.
+    # "" = not reported (pre-0.40 Ollama, or an older node agent).
+    runner: str = ""
+    # The manifest digest of the runner serving this name.  An Ollama upgrade can
+    # rewrite the digest of an *already resident* model, after which the next
+    # request for that name loads the new digest as a SECOND runner -- observed
+    # on both models of this fleet on 2026-10-10 (114 GB, then 156 GB, for two
+    # logical models, neither ever idling out under KEEP_ALIVE=-1).  Without this
+    # field herd cannot tell two runners for one name apart, which makes "the
+    # resident context for model M" ambiguous and the num_ctx pin a guess.
+    # "" = not reported (older node agent).
+    digest: str = ""
 
 
 class ModelTagMeta(BaseModel):

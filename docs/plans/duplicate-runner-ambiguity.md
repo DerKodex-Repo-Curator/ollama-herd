@@ -101,15 +101,19 @@ checks already share `_operator_num_ctx_overrides()` on the same principle.
 
 ---
 
-## Phase 1 — Carry the digest (and the runner)
+## Phase 1 — Carry the digest (and the runner) — ✅ DONE 2026-10-11
 
 Add `digest: str = ""` and `runner: str = ""` to `LoadedModel`; populate both at
 `common/ollama_client.py:50` from the `/api/ps` fields. Defaults empty so a
 mixed-version fleet and older agents keep working unchanged, matching how
 `models_available_sizes` and `max_loaded_models` were introduced.
 
-**Done when:** `/fleet/status` shows a digest and runner per loaded model, and a
-test asserts an older agent's payload without them still validates.
+**Done 2026-10-11.** `/fleet/status` carries both per loaded model; defaults are
+`""` so a pre-0.40 Ollama and an older agent are unaffected. Six tests in
+`tests/test_models/test_loaded_model_runner_digest.py`, including the real
+captured 0.40.2 payload, an older-agent payload with neither key, and one
+asserting `runner` is not conflated with herd's `mlx:` routing prefix. Phase 2
+of the MLX plan is the same change — it shipped once.
 
 ## Phase 2 — One definition of the resident context, which can say "unknown"
 
