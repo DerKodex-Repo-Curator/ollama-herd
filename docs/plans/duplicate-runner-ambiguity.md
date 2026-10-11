@@ -1,8 +1,7 @@
 # One model, two runners — removing the ambiguity the `num_ctx` pin depends on
 
-**Status**: **PHASE 1 DONE (2026-10-11); PHASES 2–4 NOT STARTED.** Phase 2 is
-the correctness fix this plan exists for — the `num_ctx` pin still takes a
-first-match answer when one name has two runners. Filed as
+**Status**: ✅ **COMPLETE (2026-10-11).** All four phases implemented and
+verified live. Filed as
 [`docs/issues.md` → "One model resident twice makes 'the resident context'
 ambiguous, and the pin guesses"](../issues.md) on 2026-10-10, after observing it
 twice on the live fleet.
@@ -117,7 +116,7 @@ captured 0.40.2 payload, an older-agent payload with neither key, and one
 asserting `runner` is not conflated with herd's `mlx:` routing prefix. Phase 2
 of the MLX plan is the same change — it shipped once.
 
-## Phase 2 — One definition of the resident context, which can say "unknown"
+## Phase 2 — One definition of the resident context, which can say "unknown" — ✅ DONE 2026-10-11
 
 Add `resident_context_for(model, node)` to `server/serializers.py`, beside
 `model_resident_on_node`:
@@ -137,7 +136,7 @@ already-correct question. Say so in the docstring, or someone will "unify" them.
 contexts and asserts the pin sends **no** `num_ctx`, and another with two
 agreeing runners asserts it sends the agreed value.
 
-## Phase 3 — Stop double-counting
+## Phase 3 — Stop double-counting — ✅ DONE 2026-10-11
 
 Dedupe by digest (falling back to name when digest is empty) in:
 `kv_cache_bloat`'s `total_vram_gb` / `total_expected_gb`,
@@ -152,7 +151,7 @@ per-entry ratio stayed under 1.5x; its *reported totals* were wrong both times.
 VRAM total counts each runner's memory once while attributing weights once per
 logical model.
 
-## Phase 4 — Make the duplicate itself visible
+## Phase 4 — Make the duplicate itself visible — ✅ DONE 2026-10-11
 
 A health check: one name, two digests, same node. Pure waste, never intentional,
 and with `KEEP_ALIVE=-1` it cannot resolve on its own — 66 GB sat stranded here
@@ -183,9 +182,11 @@ that would have caught the incident in minutes rather than hours.
 
 ## Open questions
 
-1. **Is `digest` stable across an Ollama restart** for an unchanged model, or
-   does it churn? If it churns, dedupe-by-digest is wrong and name is the only
-   key. Phase 1 makes this observable; check it before Phase 3 relies on it.
+1. ~~**Is `digest` stable across an Ollama restart** for an unchanged model?~~
+   **ANSWERED 2026-10-11 — yes, stable.** A full Ollama restart (quit the
+   Electron parent, reap `llama-server`, relaunch) left both models on their
+   same digests: `gpt-oss:120b` `ad84bf7720de` and `gemma3:27b` `8dda00f4f636`
+   before and after. So dedupe-by-digest is sound, which Phase 3 relies on.
 2. **Should the pin prefer the runner that is actually serving?** `/api/ps` gives
    no such field, and `requests_active` is per entry — worth checking whether it
    discriminates in practice, though "refuse to guess" is correct regardless.
@@ -198,3 +199,43 @@ that would have caught the incident in minutes rather than hours.
 It is not a fix for Ollama's manifest rewriting or its `stop` semantics, and it
 does not try to keep duplicates from happening. It makes herd correct in their
 presence and loud about them — which is what the incident showed was missing.
+
+
+---
+
+## Outcome (2026-10-11)
+
+**Phase 2** — `serializers.resident_context_for(model, node)` is the one
+definition, beside `model_resident_on_node` for the same reason. It returns 0
+("unknown") when a name's runners disagree on context, which is deliberately the
+same value as "not resident" so `_pin_resident_num_ctx` passes the request
+through untouched rather than asserting a window — ambiguity did not become a
+third code path. `streaming._get_loaded_context` delegates to it. The other two
+first-match sites (`_find_context_upgrade`'s size, the queue's size) now take
+the **largest** entry rather than the first, because both gate memory decisions
+where understating resident size is the unsafe direction. The `max()` callers
+were left alone, as planned.
+
+**Phase 3** — `distinct_resident_models` (digest-keyed) and
+`distinct_resident_model_names`. VRAM totals count every *runner*, since two
+runners are two processes holding real memory; `models_loaded_count`,
+`free_slots` and `underutilized_memory` count *logical models*, which is what
+they mean. `num_ctx_override_inert` emits one row per `(model, node)`.
+
+**Phase 4** — the `duplicate_runners` check (49 total). Severity follows
+reclaimable memory: the gemma3 duplicate (23.4 GB) is INFO, the gpt-oss one
+(66.4 GB) is WARNING. It calls out divergent contexts explicitly, because that
+is when Phase 2 stops injecting `num_ctx` for the model. It needs two
+*distinct* digests, so an older agent reporting none is never flagged — two
+entries we cannot tell apart are not evidence of two runners.
+
+**Verified live:** the pin fires off the new helper, `models_loaded_count` is 3
+for three distinct models with `free_slots` 7, and `duplicate_runners` is
+correctly silent with no duplicates present. 1886 tests.
+
+One detail worth keeping: `distinct_resident_models` reads the digest with
+`getattr(loaded, "digest", "")`, not attribute access. This module is handed
+duck-typed node objects throughout, and plain access broke 15 existing tests
+immediately — the codebase's own idiom (`decode_parallelism_for`,
+`model_resident_on_node`) was already `getattr` with a default for exactly that
+reason.

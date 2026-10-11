@@ -178,7 +178,11 @@ def serialize_node(node) -> dict:
         # keeps /fleet/status (polled by the dashboard) from growing ~250 bytes
         # per model per node for data nothing here reads.
         data["ollama"] = node.ollama.model_dump(exclude={"models_available_meta"})
-        loaded = len(node.ollama.models_loaded)
+        # Logical models, not runner entries.  One name can have two runners
+        # after an Ollama manifest rewrite, and both of these are answers about
+        # *models*: a duplicate must not consume an apparent hot-model slot it
+        # does not occupy, and `free_slots` is reported to clients.
+        loaded = len(distinct_resident_model_names(node))
         data["models_loaded_count"] = loaded
         data["free_slots"] = max(0, cap - loaded)
     else:
@@ -206,6 +210,96 @@ def serialize_node(node) -> dict:
         data["mlx_servers"] = [s.model_dump() for s in node.mlx_servers]
         data["mlx_bind_host"] = node.mlx_bind_host
     return data
+
+
+def distinct_resident_models(node) -> list:
+    """One entry per *runner*, deduplicated by digest — Ollama's own identity.
+
+    ``models_loaded`` can hold two entries for one model name, because an Ollama
+    upgrade can rewrite the manifest digest of an already-resident model and the
+    next request loads the new digest as a separate runner.  Counting those
+    entries naively inflates every total derived from them: on 2026-10-10 this
+    fleet read **3 models loaded** for two logical ones and summed **156 GB** of
+    "loaded model" VRAM.
+
+    Deduplicating by **digest** rather than name, because two runners for one
+    name are two real processes each holding real memory — a VRAM total should
+    count both.  What must not double is the *logical model*: its name, its
+    weights, its slot. So callers get every runner here and use ``name`` when
+    they mean "how many models", which is what the duplicate makes ambiguous.
+
+    Digest is stable across an Ollama restart (verified 2026-10-11: both of this
+    fleet's models kept their digests through a full restart), so it is a sound
+    key. An entry reporting no digest — a pre-0.40 Ollama or an older node agent
+    — falls back to its name, which is the pre-existing behaviour.
+    """
+    ollama = getattr(node, "ollama", None) if node is not None else None
+    if ollama is None:
+        return []
+    seen: set = set()
+    out = []
+    for loaded in ollama.models_loaded or []:
+        # getattr, not attribute access: this module is handed duck-typed node
+        # objects throughout (see context_compactor's docstring), and an older
+        # node agent's LoadedModel has no digest at all.  Falling back to the
+        # name is the pre-existing behaviour for exactly those payloads.
+        key = getattr(loaded, "digest", "") or loaded.name
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(loaded)
+    return out
+
+
+def distinct_resident_model_names(node) -> set[str]:
+    """Logical model names resident on ``node`` — the "how many models" answer.
+
+    Two runners for one name are one model here, which is what
+    ``underutilized_memory`` and ``free_slots`` mean when they count.
+    """
+    return {lm.name for lm in distinct_resident_models(node)}
+
+
+def resident_context_for(model: str, node) -> int:
+    """The context ``model`` is resident at on ``node``, or 0 when unknowable.
+
+    Lives beside ``model_resident_on_node`` for the same reason that one does:
+    several callers need the answer and must not drift on it.  Before this, each
+    looked for itself and they disagreed — ``streaming._get_loaded_context``,
+    ``_find_context_upgrade`` and the queue's size lookup took the **first**
+    match, while ``context_optimizer`` and the ``num_ctx_unmanaged`` check took
+    ``max()``.
+
+    **It refuses to guess.** One name can have two runners: an Ollama upgrade
+    can rewrite the manifest digest of an already-resident model, after which
+    the next request for that name loads the new digest as a *second* runner.
+    Observed on both of this fleet's models on 2026-10-10 (114 GB, then 156 GB,
+    for two logical models; `KEEP_ALIVE=-1` meant neither ever idled out).
+
+    When two runners disagree about context, there is no right single answer —
+    which one serves a given request is Ollama's choice — so this returns 0,
+    meaning *unknown*. That is deliberately the same value as "not resident",
+    because every caller already handles it: ``_pin_resident_num_ctx`` passes
+    the request through untouched rather than asserting a window. Ambiguity must
+    not become a third code path.
+
+    Both live duplicates happened to agree, so the old first-match answer was
+    right by luck. Had they differed, the pin would have sent 131072 for a name
+    whose other runner was at 32768 and forced the reload it exists to prevent —
+    intermittently, while appearing to work.
+    """
+    ollama = getattr(node, "ollama", None) if node is not None else None
+    if ollama is None:
+        return 0
+    contexts = {
+        loaded.context_length or 0
+        for loaded in (ollama.models_loaded or [])
+        if loaded.name == model
+    }
+    if len(contexts) != 1:
+        # 0 runners (not resident) or several that disagree (unknowable).
+        return 0
+    return contexts.pop()
 
 
 def model_resident_on_node(model: str, node) -> bool:

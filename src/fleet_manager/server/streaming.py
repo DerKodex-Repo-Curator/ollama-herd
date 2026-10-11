@@ -1219,14 +1219,16 @@ class StreamingProxy:
             return []
 
     def _get_loaded_context(self, model: str, node_id: str) -> int:
-        """Look up the context length of a loaded model on a node. Returns 0 if unknown."""
-        node = self._registry.get_node(node_id)
-        if not node or not node.ollama:
-            return 0
-        for loaded in node.ollama.models_loaded:
-            if loaded.name == model:
-                return loaded.context_length or 0
-        return 0
+        """Context ``model`` is resident at on ``node_id``, or 0 if unknowable.
+
+        Delegates to ``serializers.resident_context_for`` so this and the
+        health checks cannot drift.  This used to take the **first** matching
+        entry, which is an arbitrary order when one name has two runners — see
+        that helper for why 0 (unknown) is the only honest answer then.
+        """
+        from fleet_manager.server.serializers import resident_context_for
+
+        return resident_context_for(model, self._registry.get_node(node_id))
 
     def _find_context_upgrade(
         self, model: str, required_ctx: int, node_id: str
@@ -1241,11 +1243,14 @@ class StreamingProxy:
             return None
 
         # Find the current model's size for comparison
-        current_size = 0.0
-        for loaded in node.ollama.models_loaded:
-            if loaded.name == model:
-                current_size = loaded.size_gb
-                break
+        # Largest entry for the name, not the first.  With two runners for one
+        # model the first is an arbitrary order, and this value gates "is the
+        # upgrade bigger than what we have" -- understating it would switch to a
+        # model that is not actually an upgrade.
+        current_size = max(
+            (lm.size_gb for lm in node.ollama.models_loaded if lm.name == model),
+            default=0.0,
+        )
 
         # Search this node first, then all nodes
         all_nodes = [node]

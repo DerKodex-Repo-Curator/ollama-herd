@@ -119,6 +119,7 @@ class HealthEngine:
         recommendations.extend(self._check_connection_failures(nodes))
         recommendations.extend(self._check_mlx_backend(nodes))
         recommendations.extend(self._check_mlx_routing_disabled(nodes))
+        recommendations.extend(self._check_duplicate_runners(nodes))
         recommendations.extend(self._check_vision_backend_missing(nodes))
         recommendations.extend(self._check_mapped_models_hot(nodes))
         recommendations.extend(self._check_anthropic_no_chat_model(nodes))
@@ -411,7 +412,12 @@ class HealthEngine:
             if node.status.value != "online":
                 continue
             avail_pct = (node.memory.available_gb / node.memory.total_gb) * 100
-            models_loaded = len(node.ollama.models_loaded)
+            # Logical models, not runner entries -- a duplicate from an Ollama
+            # manifest rewrite would otherwise read as an extra loaded model and
+            # suppress this card.
+            from fleet_manager.server.serializers import distinct_resident_model_names
+
+            models_loaded = len(distinct_resident_model_names(node))
             if avail_pct > self.MEMORY_UNDERUTIL_PCT and models_loaded <= 2:
                 recs.append(
                     Recommendation(
@@ -496,8 +502,16 @@ class HealthEngine:
             if node.status.value != "online":
                 continue
 
-            # Sum up VRAM used by loaded models
-            total_vram_gb = sum(m.size_gb for m in node.ollama.models_loaded)
+            # VRAM counts every *runner* -- two runners for one name are two
+            # processes each holding real memory.  Weights below are attributed
+            # once per runner too, so the ratio stays meaningful; what would
+            # break is counting one runner twice, which `distinct_resident_models`
+            # prevents (digest-keyed).  On 2026-10-10 the undeduplicated sum read
+            # 156 GB for two logical models.
+            from fleet_manager.server.serializers import distinct_resident_models
+
+            runners = distinct_resident_models(node)
+            total_vram_gb = sum(m.size_gb for m in runners)
             if total_vram_gb == 0:
                 continue
 
@@ -508,7 +522,7 @@ class HealthEngine:
             disk_sizes = getattr(node.ollama, "models_available_sizes", None) or {}
             total_expected_gb = 0.0
             bloated_models = []
-            for m in node.ollama.models_loaded:
+            for m in runners:
                 expected_gb = self._weight_size_gb(m, disk_sizes)
                 if expected_gb > 0:
                     overhead_ratio = m.size_gb / expected_gb
@@ -1253,6 +1267,7 @@ class HealthEngine:
             return []
 
         mismatched: list[dict] = []
+        seen_pairs: set[tuple[str, str]] = set()
         for node in nodes:
             if not node.ollama:
                 continue
@@ -1260,6 +1275,13 @@ class HealthEngine:
                 want = overrides.get(loaded.name, 0)
                 have = loaded.context_length or 0
                 if want > 0 and have > 0 and have != want:
+                    # One row per (model, node).  Two runners for one name after
+                    # an Ollama manifest rewrite would otherwise name the same
+                    # model twice on the same node in one card.
+                    pair = (loaded.name, node.node_id)
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
                     mismatched.append({
                         "model": loaded.name,
                         "node_id": node.node_id,
@@ -1850,6 +1872,111 @@ class HealthEngine:
     # ------------------------------------------------------------------
     # MLX backend checks (Phase 5 of docs/plans/mlx-backend-for-large-models.md)
     # ------------------------------------------------------------------
+
+    def _check_duplicate_runners(self, nodes) -> list[Recommendation]:
+        """One model name resident twice — two runners, two digests, one model.
+
+        An Ollama upgrade can rewrite the manifest digest of an **already
+        resident** model. A runner loaded before the rewrite keeps the old
+        digest; the next request for that name resolves to the new one, which
+        Ollama treats as a different model and loads as a *second* runner. With
+        ``OLLAMA_KEEP_ALIVE=-1`` neither copy ever idles out.
+
+        Observed on both of this fleet's models on 2026-10-10, after `0.40.2`
+        arrived with a reboot and rewrote both tags a minute apart: resident
+        memory went 114 GB, then **156 GB**, for two logical models. **66 GB sat
+        stranded until a human looked** — nothing surfaced it, because every
+        count derived from ``models_loaded`` simply read one model higher.
+
+        What does it fire on when everything is working? Nothing. Two digests
+        for one name on one node is not a state Ollama reaches in normal
+        operation. And is it deriving something it could be told? No — it is
+        told, by ``digest``, which ``/api/ps`` has always reported and herd
+        only began carrying on 2026-10-11.
+
+        Severity follows the reclaimable memory rather than the mere fact of
+        duplication: the smaller runner is pure waste, and on a 512 GB box
+        24 GB is a note while 66 GB is worth interrupting someone for.
+        """
+        recs = []
+        for node in nodes:
+            if node.status.value == "offline" or not node.ollama:
+                continue
+            by_name: dict[str, list] = {}
+            for loaded in node.ollama.models_loaded or []:
+                by_name.setdefault(loaded.name, []).append(loaded)
+
+            dupes = []
+            for name, entries in by_name.items():
+                digests = {getattr(e, "digest", "") for e in entries}
+                # Needs two *distinct* digests. Two entries sharing one digest
+                # would be a reporting artifact, not two runners -- and entries
+                # with no digest at all (older agent) cannot be told apart, so
+                # they are deliberately not flagged.
+                if len(entries) < 2 or len(digests) < 2 or "" in digests:
+                    continue
+                sizes = sorted((e.size_gb for e in entries), reverse=True)
+                dupes.append({
+                    "model": name,
+                    "runners": len(entries),
+                    "digests": sorted(d[:12] for d in digests),
+                    "total_gb": round(sum(sizes), 1),
+                    # everything but the largest runner is reclaimable
+                    "reclaimable_gb": round(sum(sizes[1:]), 1),
+                    "contexts": sorted({e.context_length or 0 for e in entries}),
+                })
+            if not dupes:
+                continue
+
+            reclaimable = sum(d["reclaimable_gb"] for d in dupes)
+            lines = ", ".join(
+                f"{d['model']} x{d['runners']} ({'/'.join(d['digests'])}, "
+                f"{d['total_gb']} GB, ~{d['reclaimable_gb']} GB reclaimable)"
+                for d in dupes
+            )
+            # Any model whose runners disagree on context is the dangerous
+            # shape: `resident_context_for` then returns unknown by design, so
+            # the num_ctx pin stops asserting a window for that model.
+            ambiguous = [d["model"] for d in dupes if len(d["contexts"]) > 1]
+            recs.append(
+                Recommendation(
+                    check_id="duplicate_runners",
+                    severity=(
+                        Severity.WARNING if reclaimable >= 32 else Severity.INFO
+                    ),
+                    title=(
+                        f"{len(dupes)} model(s) resident twice on {node.node_id}: "
+                        f"~{reclaimable:.0f} GB stranded"
+                    ),
+                    description=(
+                        f"One model name is served by more than one runner, each "
+                        f"holding its own copy of the weights: {lines}. This "
+                        f"happens when an Ollama upgrade rewrites the manifest "
+                        f"digest of an already-resident model — the next request "
+                        f"for that name loads the new digest as a second runner, "
+                        f"and OLLAMA_KEEP_ALIVE=-1 means neither ever idles out."
+                        + (
+                            f" **{', '.join(ambiguous)} has runners at different "
+                            f"contexts, so herd can no longer say what context "
+                            f"that model is resident at and stops injecting "
+                            f"num_ctx for it.**"
+                            if ambiguous
+                            else ""
+                        )
+                    ),
+                    fix=(
+                        "Run `ollama stop <model>` **twice** — the first call "
+                        "takes the *current* digest and leaves the stale one, "
+                        "measured on two models — then send one request through "
+                        "the router (:11435) to cold-load it with its configured "
+                        "num_ctx applied. Verify with `curl -s "
+                        "localhost:11434/api/ps` that one digest remains."
+                    ),
+                    node_id=node.node_id,
+                    data={"duplicates": dupes, "reclaimable_gb": round(reclaimable, 1)},
+                )
+            )
+        return recs
 
     def _check_mlx_routing_disabled(self, nodes) -> list[Recommendation]:
         """A node is running MLX servers the router will never route to.

@@ -18,7 +18,7 @@ The `--extra embedding` now also installs `fastembed` for the **native text embe
 
 ```bash
 uv sync --extra dev              # install test deps (first time only)
-uv run pytest                    # run all 1804 tests (~15s)
+uv run pytest                    # run all 1886 tests (~15s)
 uv run pytest tests/test_server/ # run server tests only
 uv run pytest tests/test_models/ # run model tests only
 uv run ruff check src/           # lint
@@ -246,7 +246,7 @@ macOS-only features (gracefully disabled elsewhere): meeting detection, mflux/Di
 | `server/hardware_lookup.py` | Chip → memory bandwidth table (Apple Silicon + discrete GPUs) powering device-aware scoring |
 | `server/queue_manager.py` | Per `node:model` queues with dynamic concurrency + zombie reaper |
 | `server/streaming.py` | httpx proxy to Ollama + NDJSON↔SSE + auto-retry + context protection + thinking model inflate |
-| `server/health_engine.py` | 46 health checks (offline, degraded, memory, KV bloat, context waste, thrashing, timeouts, errors, retries, disconnects, streams, version, protection, zombies, connection failures, priority models) |
+| `server/health_engine.py` | 49 health checks (offline, degraded, memory, KV bloat, context waste, thrashing, timeouts, errors, retries, disconnects, streams, version, protection, zombies, connection failures, priority models) |
 | `server/context_optimizer.py` | Dynamic num_ctx: analyzes token usage, auto-calculates optimal context, queues Ollama restarts via heartbeat commands |
 | `server/benchmark_engine.py` | Benchmark core: fleet discovery, multimodal request gen (LLM + embed + image), report building |
 | `server/benchmark_runner.py` | Server-side runner: smart mode (fill memory from disk/catalog), progress tracking, model type selection |
@@ -355,7 +355,7 @@ Silent failures are dishonest. Fail fast, fail loud.
 
 ## Current State (as of 2026-10-11)
 
-- **Version: `0.11.0` — published** to PyPI + GitHub + Homebrew on 2026-10-11. Minor rather than patch: alongside two fixes it adds a trace column (`estimated_tokens`, via ALTER TABLE), a new `no_output` request status and a new `num_ctx_unmanaged` check. **1804 tests, 46 health checks.** No dependency changes, so the Homebrew bump was version + sha256 only.
+- **Version: `0.11.0` — published** to PyPI + GitHub + Homebrew on 2026-10-11. Minor rather than patch: alongside two fixes it adds a trace column (`estimated_tokens`, via ALTER TABLE), a new `no_output` request status and a new `num_ctx_unmanaged` check. **1886 tests, 49 health checks.** No dependency changes, so the Homebrew bump was version + sha256 only.
 
   **The headline fix: an absent `num_ctx` is not neutral.** A per-model `FLEET_NUM_CTX_OVERRIDES` entry could not survive one request — the router correctly declined to re-inject once a model was resident at its configured context, the request went out bare, and Ollama filled the gap from `OLLAMA_CONTEXT_LENGTH` and reloaded the model at the larger window, evicting its co-resident peer. `StreamingProxy._pin_resident_num_ctx` now sends the resident value, which cannot trigger a reload. Also `kv_cache_bloat` no longer invents KV cache out of guessed weights. Both in the gotchas above.
 
@@ -406,7 +406,7 @@ Silent failures are dishonest. Fail fast, fail loud.
   ```
   Refresh **all four locations**, not just CLAUDE.md — the skills are where the drift hides.
 
-- **Health:** 46 distinct checks (count via `grep -oE 'check_id="[^"]+"' src/fleet_manager/server/health_engine.py | sort -u | wc -l`). Monitor: `curl http://localhost:11435/dashboard/api/health`
+- **Health:** 49 distinct checks (count via `grep -oE 'check_id="[^"]+"' src/fleet_manager/server/health_engine.py | sort -u | wc -l`). Monitor: `curl http://localhost:11435/dashboard/api/health`
 
 ## Conventions
 

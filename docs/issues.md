@@ -292,7 +292,7 @@ threshold on its own."* Health score 78 → 85. Covered by
 
 ---
 
-### One model resident twice makes "the resident context" ambiguous, and the pin guesses `OPEN` (2026-10-10)
+### One model resident twice makes "the resident context" ambiguous, and the pin guesses `FIXED` (2026-10-11)
 
 **Severity:** MEDIUM — observed on the live fleet; the expensive half is
 reasoned from the code and a simulation, not yet witnessed.
@@ -397,7 +397,7 @@ pin working most of the time.
    a corresponding cold-load trace is the same event seen from the router, and
    `underutilized_memory` fires off that count.
 
-**Plan: [`plans/duplicate-runner-ambiguity.md`](plans/duplicate-runner-ambiguity.md)** — four phases, with step 1 (carry the digest) shared with the MLX-runner plan since both need the same one-site edit to `common/ollama_client.py`. The audit found `/api/ps` already returns `digest` *and* the new `runner` field, and `LoadedModel` is built in exactly one place.
+**Fixed 2026-10-11, all four phases** — [`plans/duplicate-runner-ambiguity.md`](plans/duplicate-runner-ambiguity.md) carries the outcome. `serializers.resident_context_for` is now the single definition and returns *unknown* when a name's runners disagree, so the pin passes through instead of guessing; counts distinguish runners (VRAM) from logical models (`free_slots`, `models_loaded_count`, `underutilized_memory`); and a `duplicate_runners` check names the stranded memory with the non-obvious two-call `ollama stop` remediation. **`digest` was verified stable across a full Ollama restart** (both models kept theirs), which is what made dedupe-by-digest sound.
 
 **Note this is a gap the 2026-10-09 fix created the conditions to notice, not
 one it introduced** — the ambiguity predates it; the pin is simply the first

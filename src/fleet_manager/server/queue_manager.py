@@ -275,12 +275,15 @@ class QueueManager:
 
         available_gb = node.memory.available_gb
 
-        # Find the model's loaded size, fall back to 0 (small model on disk)
-        model_size_gb = 0.0
-        for m in node.ollama.models_loaded:
-            if m.name == model:
-                model_size_gb = m.size_gb
-                break
+        # Find the model's loaded size, fall back to 0 (small model on disk).
+        # Largest entry, not the first: one name can have two runners when an
+        # Ollama upgrade rewrites a resident model's digest, and the first match
+        # is an arbitrary order.  This feeds concurrency/memory math, where
+        # understating resident size is the unsafe direction.
+        model_size_gb = max(
+            (m.size_gb for m in node.ollama.models_loaded if m.name == model),
+            default=0.0,
+        )
 
         # If capacity learning is active, respect the ceiling
         if node.capacity and node.capacity.ceiling_gb > 0:
