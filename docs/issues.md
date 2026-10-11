@@ -254,6 +254,8 @@ pin working most of the time.
    a corresponding cold-load trace is the same event seen from the router, and
    `underutilized_memory` fires off that count.
 
+**Plan: [`plans/duplicate-runner-ambiguity.md`](plans/duplicate-runner-ambiguity.md)** — four phases, with step 1 (carry the digest) shared with the MLX-runner plan since both need the same one-site edit to `common/ollama_client.py`. The audit found `/api/ps` already returns `digest` *and* the new `runner` field, and `LoadedModel` is built in exactly one place.
+
 **Note this is a gap the 2026-10-09 fix created the conditions to notice, not
 one it introduced** — the ambiguity predates it; the pin is simply the first
 consumer whose correctness depends on the answer being unique. Found by acting
@@ -1870,7 +1872,9 @@ Ollama now has a **first-party native MLX runner** ([ollama.com/blog/mlx](https:
 
 **Not threatened:** the herd's core value is routing (scoring, queues, health, multi-node) — a faster Ollama helps it for free — and **distributed multi-Mac inference is still ours** (Ollama is single-host). The decisive unknown is **Ollama's MLX model coverage** (the preview accelerated only Qwen3.5-35B-A3B; `mlx_lm` runs arbitrary HF conversions).
 
-**We are 8 versions behind:** latest is **v0.32.1**; `0.24.0` **predates stable MLX** (the 0.30 line). Full analysis + verified-vs-unverified split: [`issues/ollama-native-mlx-runner.md`](issues/ollama-native-mlx-runner.md). **Execution plan** (upgrade to v0.32.1 + the four measurements that decide the MLX subsystem's fate, install landmines, rollback): [`plans/ollama-0.32-upgrade-and-mlx-evaluation.md`](plans/ollama-0.32-upgrade-and-mlx-evaluation.md).
+**Update 2026-10-11 — the deferred question is now answerable.** The upgrade plan was executed 2026-07-17 and Q1–Q4 answered, but Q4 (coverage) came back *"MLX is NOT active — all gains are llama.cpp"*, which made the subsystem decision premature. Since then: **`0.40` makes MLX the default runner on Apple Silicon** (per model, via `IsMLX()` == `format == "safetensors"`, no flag), we are on `0.40.2`, and **`/api/ps` now reports a `runner` field per loaded model** — so July's 5 MB log-grep is replaced by a field herd already fetches every heartbeat. A `strings` pass on the 0.40.2 binary shows `mlxrunner` 3,636 times with draft/MTP support but **no `kv-bits`/`quantized-kv` strings**, which the compactor depends on. Current scope at stake: **2,881 lines** across `mlx_supervisor` (1,264), `mlx_proxy` (1,596) and `mlx_client` (21), `mlx` in **36 files**, and **203 of 1,804 tests**.
+
+**Plan: [`plans/ollama-mlx-runner-subsystem-decision.md`](plans/ollama-mlx-runner-subsystem-decision.md)** — Phase 5 of the July plan, with the evidence it was waiting for. Prior analysis: [`issues/ollama-native-mlx-runner.md`](issues/ollama-native-mlx-runner.md); executed upgrade: [`plans/ollama-0.32-upgrade-and-mlx-evaluation.md`](plans/ollama-0.32-upgrade-and-mlx-evaluation.md).
 
 ---
 

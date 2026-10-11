@@ -1,6 +1,8 @@
 # Ollama 0.24 → 0.32.1 Upgrade + Native-MLX Evaluation
 
-**Status**: ✅ **EXECUTED 2026-07-17.** Upgraded to v0.32.1; Q1–Q4 all answered (results below); glm issue closed upstream. Remaining: Phase 5 (the subsystem decision) and one untested lever (`OLLAMA_NEW_ENGINE=1`).
+**Status**: ✅ **EXECUTED 2026-07-17.** Upgraded to v0.32.1; Q1–Q4 all answered (results below); glm issue closed upstream.
+
+> **Phase 5 has moved to its own plan: [`ollama-mlx-runner-subsystem-decision.md`](ollama-mlx-runner-subsystem-decision.md)** (2026-10-11). Q4 answered *"MLX is NOT active"*, which made the subsystem decision premature — Ollama `0.40` has since made MLX the default runner on Apple Silicon, and `/api/ps` now reports the runner per model, so the question is finally measurable. The other loose end here, `OLLAMA_NEW_ENGINE=1`, **no longer exists**: Ollama deleted both CGO engines in PR #16031 and the var is absent from `envconfig/config.go`.
 
 ---
 
