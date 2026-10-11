@@ -149,6 +149,57 @@ note implies.
 
 ---
 
+### `/v1/chat/completions` gets no context protection at all `OPEN` (2026-10-11)
+
+**Severity:** HIGH — it defeats the 0.11.0 `num_ctx` pin on an entire API
+surface, and it is the surface the context-window field report was about.
+
+`StreamingProxy._build_ollama_body` calls `_apply_context_protection` **inside
+the branch gated on `original_format in (OLLAMA, ANTHROPIC, RESPONSES)`**, which
+ends in `return body`. `openai_compat.py` sets
+`original_format=RequestFormat.OPENAI`, so an OpenAI-format request falls through
+to the builder below — which calls `_apply_thinking_overhead` but **not**
+`_apply_context_protection`.
+
+So for `/v1/chat/completions`: no `FLEET_NUM_CTX_OVERRIDES` injection, no
+resident-context pin, no overflow detection, no strip/upgrade.
+
+**Proven with a model that has no background traffic** (`glm-4.7-flash`,
+override 32768, zero other callers):
+
+| request | context-protection actions logged |
+|---|---|
+| `/v1/chat/completions` | **0** |
+| `/api/generate` | **1** — `Dynamic num_ctx: injected num_ctx=32768` |
+
+**Measured cost.** A cold load of `glm-4.7-flash` via `/v1/chat/completions`
+came up at **131072/slot instead of its configured 32768** — `-c 524288 -np 4`
+— and sat at **48 GB resident for a 19 GB model**, i.e. ~29 GB of KV where
+~7 GB was intended.
+
+**This corrects a conclusion in
+[`plans/context-window-blindness.md`](plans/context-window-blindness.md).** That
+plan recorded the field report's root cause as not reaching herd, because "it
+calls `/api/chat` downstream, where an OpenAI-format request has no `num_ctx`
+field". The downstream protocol was the right observation and the wrong
+inference: herd does call `/api/chat`, but for OpenAI-format requests it never
+*adds* `num_ctx`, so the window is whatever Ollama defaults to. **The reported
+failure mode does reach herd, by a different route than the one dismissed.**
+
+**Proposed fix.** Do not add OPENAI to the first branch — that branch also
+assumes an Ollama-shaped `raw_body` whose params live under `options`, and
+OpenAI params are top-level (the same distinction `mlx_proxy._to_openai_body`
+already has to make). Instead call `_apply_context_protection` on the body the
+fallback builder produces, immediately before `_apply_thinking_overhead`, which
+is already called there. One line, at the one place both formats converge.
+
+**Then check the other formats are really covered**, rather than assuming:
+`RESPONSES` and `ANTHROPIC` take the first branch today, but a test should pin
+each surface's behaviour by format, because the bug is precisely that one format
+silently missed a call the others got.
+
+---
+
 ### `high_error_rate` has no minimum sample size, so three requests can trip a WARNING `FIXED` (2026-10-11)
 
 **Severity:** LOW-MEDIUM — a WARNING an operator cannot act on is how a board
@@ -1948,12 +1999,46 @@ Ollama now has a **first-party native MLX runner** ([ollama.com/blog/mlx](https:
 
 ---
 
-### GLM-4.7-Flash ~4× too slow on Ollama (glm4moelite MoE not exploited) `OPEN` (upstream)
+### GLM-4.7-Flash is not usable on Ollama on this box — keep MLX `CONFIRMED` (2026-10-11, upstream)
 
 **File:** none (upstream Ollama bug — herd serves/measures correctly)
 **Severity:** Medium (affects model selection/benchmarking; no correctness impact)
 
 `glm-4.7-flash` decodes at ~13.7 tok/s on the M3 Ultra via Ollama — the speed of the **dense** `gemma3:27b` — despite being a **30B-A3B MoE with 3B active params** that should match `qwen3-coder:30b-a3b` (~56.7 tok/s). Ollama's `glm4moelite` path doesn't exploit the sparsity and CPU-offloads the experts ([ollama/ollama#14045](https://github.com/ollama/ollama/issues/14045)). Compounded by interleaved thinking (~3,600 output tokens vs qwen's ~400) and a 202,752-token default context (51 s prefill). **Fix:** serve via MLX (verify `mlx-lm` supports `glm4_moe_lite` — [mlx-lm#806](https://github.com/ml-explore/mlx-lm/issues/806) — our pinned 0.31.3 may need an upgrade + re-patch); herd-side, cap `num_ctx` to cut the prefill. Full analysis: [`issues/glm-4.7-flash-ollama-glm4moelite-slow.md`](issues/glm-4.7-flash-ollama-glm4moelite-slow.md).
+
+**Measured 2026-10-11 on Ollama `0.40.2`, all-time trace data.** The decision
+criterion was "support GLM on MLX only if it is meaningfully faster". It is not a
+speed question:
+
+| path | completed | retried at the 600 s timeout | failed | avg output tokens |
+|---|---|---|---|---|
+| **Ollama** | 30 (worst **641 s**) | **235** | 12 (worst **5,205 s** = 87 min) | **3,268** |
+| **MLX** | 27 (worst 266 s) | 0 | 1 | **556** |
+
+**247 of 277 Ollama attempts (89%) never completed normally.** Today: one
+completion at 24 s, then five consecutive requests all hitting the 600 s timeout.
+The MLX path answered in **2.93 s for 84 tokens** on the same box minutes later.
+Note also the ~6x output-token gap — Ollama's GLM emits ~3,268 tokens where MLX
+emits ~556 for comparable work, which is the interleaved-thinking symptom above
+compounding the slowness.
+
+**So MLX is the only usable GLM path here, and the `mlx:` subsystem keeps earning
+its place for this model.** This resolves the last open sub-question of
+[`plans/ollama-mlx-runner-subsystem-decision.md`](plans/ollama-mlx-runner-subsystem-decision.md)
+Phase 1 → **hold**.
+
+**Two records said otherwise and are not reproducible here.** The 2026-07-17
+upgrade plan recorded *"Q2 glm: 13.7 → 77.8 tok/s … Issue closed"*, and CLAUDE.md
+carried *"Ollama is FASTER than our MLX: glm 77.8 tok/s via Ollama vs 59 via
+mlx_lm.server"*. Neither survives contact with the trace history above, and this
+issue's own `OPEN` marking turned out to be the accurate one — the plan marked it
+closed and `docs/issues.md` never agreed. **Attempting to reproduce the Ollama
+number also wedged Ollama**: after repeated glm load attempts it answered
+`/api/version` in 0.6 ms while being unable to start any new runner, including a
+direct non-herd request for `gemma3:27b` that hung a full 300 s. That is the
+"Ollama watchdog can't escalate" issue below, reproduced; recovery needed the
+documented full restart (quit the Electron parent, reap `llama-server`, relaunch),
+after which gemma3 loaded in 7.3 s.
 
 ---
 
