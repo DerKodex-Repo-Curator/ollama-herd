@@ -8,11 +8,13 @@ import logging
 import typer
 from rich.logging import RichHandler
 
-# MUST run before any settings class is imported — pydantic-settings reads
-# ``os.environ`` at instantiation.  See ``common/env_file.py``.
+# Called inside the ``start()`` callback below, NOT at module scope: it mutates
+# ``os.environ``, so at module scope merely *importing* this module injected the
+# operator's whole env file into the importing process.  The ordering requirement
+# still holds — pydantic-settings reads ``os.environ`` at instantiation, Typer
+# runs this group callback before any subcommand, and ``NodeSettings`` is
+# imported *inside* ``start()``.  See ``common/env_file.py``.
 from fleet_manager.common.env_file import load_env_file
-
-load_env_file()
 
 app = typer.Typer(
     name="herd-node",
@@ -71,6 +73,7 @@ def start(
     log_level: str = typer.Option("INFO", help="Log level"),
 ):
     """Start the Herd Node agent on this device."""
+    load_env_file()
     logging.basicConfig(
         level=getattr(logging, log_level.upper(), logging.INFO),
         format="%(message)s",

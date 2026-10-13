@@ -890,7 +890,34 @@ does. Verified in both orders and with the new file first: 1868 passing.
 
 ---
 
-### Importing a CLI module injects the operator's env file into the process `OPEN`
+### Importing a CLI module injects the operator's env file into the process `FIXED` (2026-10-13)
+
+> `load_env_file()` moved from module scope into each CLI's **existing**
+> `@app.callback(invoke_without_command=True)`. Typer runs a group callback before
+> any subcommand, so one line per file covers `herd`, `herd-node` and all three
+> `herd mlx …` subcommands with no new initialization layer.
+>
+> **Placed before the subcommand early-return**, because `server_cli`'s callback
+> returns immediately when a subcommand was invoked, and `herd mlx pull` reads
+> settings too — loading the env only on the no-subcommand path would have
+> silently changed its configuration.
+>
+> **Measured: importing both CLIs went from 28 injected `FLEET_*` variables to 0.**
+> The ordering guarantee the old placement defended still holds — `ServerSettings`
+> and `NodeSettings` are imported *inside* `start()` — and the comment explaining
+> it was updated rather than deleted.
+>
+> Verified by running the binaries, not by reading the code: after a restart the
+> router still resolves `FLEET_NUM_CTX_OVERRIDES` from `~/.fleet-manager/env`
+> (`context_waste` reports "pinned at 131,072" / "pinned at 32,768") and the
+> `num_ctx` pin still fires, which requires `FLEET_DYNAMIC_NUM_CTX` from that same
+> file. `herd mlx list`, `herd --help` and `herd-node --help` all work.
+>
+> `tests/test_models/test_cli_env_precedence.py` now **imports** the CLIs in a
+> subprocess to assert zero injection — the test that could not exist before —
+> and separately pins the call's *placement*, because the import test passes
+> vacuously on a machine with no env file, which is exactly where this bug was
+> invisible.
 
 **Severity:** medium — latent, but it fails in the direction that is hardest to
 diagnose: green on CI, red on a configured machine.
@@ -2438,7 +2465,23 @@ The dashboard is a large amount of inline HTML/CSS/JS in Python strings across 5
 
 ## Test Coverage Gaps
 
-### 10. Untested Modules `PARTIAL` (narrowed 2026-10-13 — 2 of 4 now covered)
+### 10. Untested Modules `FIXED` (2026-10-13 — all four covered)
+
+> `common/discovery.py` (9 tests) and `server/rebalancer.py` (15 tests) closed the
+> remaining two. Both follow mocking patterns already in the suite —
+> `MagicMock`/`AsyncMock` as in `test_mlx_client.py` — rather than adding a
+> fixture layer.
+>
+> What they cover is the behaviour that fails *quietly*: discovery's
+> stale-registration retry (the `except` branch that re-creates `AsyncZeroconf`
+> after a crashed process left a registration behind), its timeout message naming
+> `--router-url`, and that `stop()` runs even when discovery fails since a leaked
+> `AsyncZeroconf` holds a socket. For the rebalancer: that pre-warm targets the
+> **runner-up** rather than the winner, that a move only goes to a node with the
+> model already **hot**, that the pre-warm lock is released even when the warm
+> raises, and that `run()` survives a failing pass — each of these is a condition
+> that silently skips rather than raising, so getting one backwards means nothing
+> ever rebalances and the only symptom is a queue that stays deep.
 
 **Severity:** Medium
 

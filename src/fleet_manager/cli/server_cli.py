@@ -10,13 +10,22 @@ import typer
 import uvicorn
 from rich.logging import RichHandler
 
-# Load ~/.fleet-manager/env before any settings class instantiates.
-# ``ServerSettings`` is only imported inside ``start()`` below, so calling
-# ``load_env_file()`` here at module-import time is early enough.
+# ``load_env_file()`` is called inside the ``start()`` callback below, NOT here at
+# module scope.  It mutates ``os.environ``, and at module scope that meant merely
+# *importing* this module injected the operator's entire env file into whatever
+# process did the importing — 28 ``FLEET_*`` variables, measured.  That has
+# already cost one debugging round: a test that imported this module failed four
+# unrelated tests, and the tests in
+# ``tests/test_models/test_cli_env_precedence.py`` had to read these files as
+# *text* rather than import them.  Same hazard class as the
+# ``_context_protection_events`` leak fixed 2026-10-11.
+#
+# The ordering guarantee the old placement defended still holds: Typer runs a
+# group callback before any subcommand, and ``ServerSettings`` is imported
+# *inside* ``start()``, so the env file is loaded before any settings class
+# instantiates on every path.
 # See ``fleet_manager/common/env_file.py`` for the rationale.
 from fleet_manager.common.env_file import load_env_file
-
-load_env_file()
 
 app = typer.Typer(
     name="herd",
@@ -49,6 +58,10 @@ def start(
     ),
 ):
     """Start the Ollama Herd router and API server."""
+    # Before the subcommand early-return below: `herd mlx pull` and friends read
+    # settings too, so loading the env file only on the no-subcommand path would
+    # silently change their configuration.
+    load_env_file()
     # If a subcommand was invoked (e.g. `herd mlx pull ...`), don't run the
     # main server-start logic — let the subcommand handler run instead.
     if ctx.invoked_subcommand is not None:

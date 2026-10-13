@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Importing either CLI module injected the operator's entire env file into the process.** `load_env_file()` ran at module scope, so `import fleet_manager.cli.server_cli` mutated `os.environ` with **28 `FLEET_*` variables** — permanently, for the rest of the session. It had already broken four unrelated tests once, and forced `test_cli_env_precedence.py` to read the CLI files as *text* rather than import them. Moved into each CLI's existing Typer callback, which runs before any subcommand, and placed before `server_cli`'s subcommand early-return because `herd mlx pull` reads settings too. 28 → 0, verified by running the binaries rather than reading the code: the router still resolves `FLEET_NUM_CTX_OVERRIDES` from `~/.fleet-manager/env` after a restart, and the `num_ctx` pin still fires.
+
+### Added
+
+- **Tests for `common/discovery.py` (9) and `server/rebalancer.py` (15)**, closing the last two entries of the untested-modules item. They cover the behaviour that fails *quietly*: discovery's stale-registration retry after a crashed process, its timeout message naming `--router-url`, cleanup on failure; and for the rebalancer, that pre-warm targets the runner-up rather than the winner, that a move only goes to a node with the model already hot, that the pre-warm lock is released even when the warm raises, and that the loop survives a failing pass. Each of those is a condition that silently skips rather than raising, so getting one backwards means nothing ever rebalances.
+
+- **A throughput runbook** in `docs/troubleshooting.md`. The per-request median tok/s is unstable by construction on a bandwidth-bound box — the decode distribution is bimodal and the median sits in the valley, swinging 42–79 on a healthy fleet — and the modes are separated by concurrency (0.77 vs 3.42 overlapping requests), not prompt size (835 vs 864 tokens). It points at the statistic the fleet already computes, p99 TPOT against a model's own baseline, with the measured margin to the `decode_degraded` threshold (1.33× observed against 2.0×).
+
 ### Changed
 
 - **`model_load_timeout` now says which of two causes it is.** The check was written for eviction — a model keeps getting pushed out, and reloading outruns the request timeout — and asserted that cause unconditionally. There is a second cause with the identical symptom and the opposite fix: Ollama can answer `/api/version` and `/api/ps` in under a millisecond while unable to start *any* new runner. Reproduced 2026-10-11, where a direct non-herd request hung the full 300 s with **350 GB free, zero swap and kernel pressure normal**, while the card advised `keep_alive: -1` (already set) and `OLLAMA_MAX_LOADED_MODELS` (already 10). The discriminator needs no new data: **two or more distinct models timing out while memory is ample cannot be eviction.** The card now names the wedge, warns that a green liveness probe means nothing in that state, gives a direct non-herd command to confirm, and points at the restart recipe.

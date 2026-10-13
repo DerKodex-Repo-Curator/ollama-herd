@@ -1,6 +1,6 @@
 # What to tackle next, and what the evidence says not to
 
-**Status**: **NOT STARTED** (2026-10-13). Written after a triage pass on
+**Status**: ✅ **COMPLETE (2026-10-13).** All three phases implemented and verified. Written after a triage pass on
 `docs/issues.md` and a measurement pass against live trace data.
 
 > **Two of the three items I recommended before measuring turned out to have no
@@ -206,7 +206,7 @@ where its logic lives.
 
 ---
 
-## Phase 1 — Point at the statistic that already exists (docs only)
+## Phase 1 — Point at the statistic that already exists (docs only) — ✅ DONE 2026-10-13
 
 Smaller than first drafted, because the audit found the measure is already
 chosen. Record in `docs/troubleshooting.md` and the CLAUDE.md throughput note:
@@ -227,7 +227,7 @@ mix moved or the fleet slowed, and is pointed at the existing check rather than
 inventing a statistic — plus the "long-context starvation" issue carries the
 measurement that contradicts its title (**done 2026-10-13**).
 
-## Phase 2 — Stop the CLI import from mutating `os.environ`
+## Phase 2 — Stop the CLI import from mutating `os.environ` — ✅ DONE 2026-10-13
 
 Move `load_env_file()` from module scope into the **existing**
 `@app.callback(invoke_without_command=True)` in each CLI — Typer runs a group
@@ -246,7 +246,7 @@ env file — verified by running them, not by reading the code. Note that
 `read_text()` (lines 51–96) specifically to avoid importing them; those checks
 should become real imports once fixed, which is the actual proof.
 
-## Phase 3 — Cover `discovery`, then `rebalancer`
+## Phase 3 — Cover `discovery`, then `rebalancer` — ✅ DONE 2026-10-13
 
 `discovery` first: it is zero-coverage and it is the path that fails when a
 network changes, which this fleet has hit (the node-identity gotcha). Then
@@ -286,3 +286,41 @@ Phase 3 is the largest and least urgent.
 It is not a ranked backlog of everything open — 16 entries remain and most are
 accepted costs. It is the subset where a measurement either supported acting or
 explicitly argued against it, and the second category is the more useful half.
+
+
+---
+
+## Outcome (2026-10-13)
+
+**Phase 1** — `docs/troubleshooting.md` gained a "Throughput *dropped* — read the
+right statistic" runbook, and CLAUDE.md the measured margin. No new metric: it
+points at `get_decode_latency_stats`' p99 TPOT and the `decode_degraded` check,
+which the audit showed were already the right answer.
+
+**Phase 2** — `load_env_file()` moved into each CLI's existing Typer callback,
+**before** `server_cli`'s subcommand early-return since `herd mlx pull` reads
+settings too. **28 injected `FLEET_*` variables → 0.** Verified by running the
+binaries: the router still resolves `FLEET_NUM_CTX_OVERRIDES` from the env file
+after a restart and the `num_ctx` pin still fires, which needs
+`FLEET_DYNAMIC_NUM_CTX` from the same file.
+
+The test that could not exist before now does — `test_cli_env_precedence.py`
+imports both CLIs in a **subprocess** and asserts zero injection. It is a
+subprocess because the damage is irreversible in-process: once the variables are
+in `os.environ`, nothing can tell whether this import or an earlier one put them
+there. And it is paired with a placement assertion, because the import test
+passes *vacuously* on a machine with no env file — which is precisely where the
+bug was invisible.
+
+**Phase 3** — 9 tests for `discovery`, 15 for `rebalancer`, closing
+`docs/issues.md` item 10 entirely (all four modules now covered). Both use
+mocking patterns already in the suite.
+
+One test was rewritten mid-implementation: the first version of discovery's
+success-path test patched so much of `discover()` that it proved nothing and
+ended up asserting a `KeyError` despite its name. The honest version captures the
+handler that `discover()` passes to `AsyncServiceBrowser` and invokes it the way
+zeroconf would, so the production closure writes into the production locals.
+
+**1921 tests** (from 1894), ruff clean, verified in multiple orders for the
+suite-order-leak class.

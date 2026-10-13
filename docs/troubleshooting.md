@@ -311,6 +311,66 @@ reasoning tokens — verified: `num_predict=24` gave `eval_count=24` with zero
 content), and the 48,000-odd traces that carry `NULL` counts because their route
 never surfaces them (embeddings, MLX). `NULL` is not zero.
 
+## Throughput "dropped" — read the right statistic before investigating
+
+**The per-request median tok/s is unstable by construction on this fleet, and it
+swings 42–79 on a perfectly healthy router.** Measured 2026-10-13 over 24 h
+(n=7,952): the decode distribution is **bimodal**, with a fast mode at ≥70 tok/s
+and a slow one at <45, and the median sits in the valley between them — so a
+small shift in the mix moves it 20 tok/s with nothing having changed.
+
+What separates the modes is **concurrency, not prompt size**:
+
+| | prompt tokens (median) | completion | TTFT | **overlapping requests** |
+|---|---|---|---|---|
+| fast (≥70 tok/s) | 835 | 193 | 483 ms | **0.77** |
+| slow (<45 tok/s) | 864 | 207 | 665 ms | **3.42** |
+
+Identical prompts; 4.4× the concurrency. This is co-tenancy on a
+bandwidth-bound box — the 2026-10-05 measurement found single-stream `gemma3`
+at 22.5 tok/s and four slots delivering 27.1, i.e. **1.2× of one slot** — and it
+is an accepted characteristic, not a fault. It is specifically *not*
+long-context starvation; prompt size does not discriminate the modes at all.
+
+**Use the statistic the fleet already computes.** `get_decode_latency_stats`
+gives p99 **TPOT** (time per output token, `(latency - ttft) / (completion - 1)`)
+per `node:model`, compared against that model's own 24 h baseline — which is what
+the `decode_degraded` health check reads. TPOT excludes TTFT, so it excludes
+queue wait and prefill: a request that waited eight minutes for a slot and then
+generated at full speed has terrible latency and *fine* TPOT, and that
+distinction is the whole point. Per-request tok/s conflates all three, which is
+how the 2026-07-19 `glm-4.7-flash` investigation lost several hours.
+
+```bash
+# what the check sees — if this is flat, decode is fine regardless of the median
+curl -s localhost:11435/dashboard/api/health | python3 -c "
+import json,sys
+for c in json.load(sys.stdin)['recommendations']:
+    if c['check_id'] == 'decode_degraded': print(c['title'], c['data'])
+else: print('decode_degraded not firing — decode is within 2x of its own baseline')"
+```
+
+**Margin, so you know how much slack there is:** replaying the check's own
+comparison across 48 half-hour windows gave a worst recent-p99/baseline-p99 ratio
+of **1.33×** against its **2.0×** threshold — a 1.51× margin, zero
+would-have-fired windows, and it has never fired. Note p99 TPOT varies *more*
+hour to hour (49% of mean) than median tok/s does (34%), so that margin is
+thinner than the threshold suggests. If it ever does fire, it means something.
+
+**Before concluding anything from a median:** check the fast-mode share instead,
+which held 47–61% in every full hour of two separate multi-hour windows.
+
+```bash
+sqlite3 ~/.fleet-manager/latency.db "
+  SELECT COUNT(*) n,
+         SUM(1000.0*(completion_tokens-1)/(latency_ms-time_to_first_token_ms) >= 70) fast
+  FROM request_traces
+  WHERE status='completed' AND timestamp > strftime('%s','now')-3600
+    AND completion_tokens > 20 AND latency_ms > time_to_first_token_ms"
+```
+
+---
+
 ## Models time out loading while Ollama looks perfectly healthy
 
 Ollama can answer `/api/version` and `/api/ps` in **under a millisecond** while
