@@ -2992,15 +2992,47 @@ class HealthEngine:
     def _check_model_load_timeouts(
         self, timeouts, recent_timeouts, nodes
     ) -> list[Recommendation]:
-        """Detect models that repeatedly time out — they can't load fast enough.
+        """Detect models that repeatedly time out — and say which of two causes it is.
 
-        This catches the pattern where a model keeps getting evicted and
-        requested again, but takes so long to reload that requests time out.
-        The cold-load detector misses these because the requests never complete.
+        The original cause this was written for: a model keeps getting evicted
+        and re-requested, but takes so long to reload that requests time out.
+        Remediation is ``keep_alive: -1`` or a larger hot-model cap.
+
+        **There is a second cause with the same symptom and the opposite
+        remediation, and the check used to assert the first one.** Ollama can
+        reach a state where it answers ``/api/version`` and ``/api/ps`` in under
+        a millisecond while being unable to start *any* new runner. Reproduced
+        2026-10-11: a direct, non-herd request for a resident-until-moments-ago
+        model hung the full 300 s, with **350 GB free, zero swap and kernel
+        pressure normal**. The card at the time read "the model is likely being
+        evicted from memory" and advised setting ``keep_alive: -1`` — which was
+        already set — and ``OLLAMA_MAX_LOADED_MODELS``, already 10. Useless
+        advice, confidently given.
+
+        The discriminator is cheap and sits in data already passed in:
+        **several distinct models timing out while memory is ample** cannot be
+        eviction, because eviction needs memory pressure and would not pick on
+        everything at once. One model timing out with memory tight is eviction;
+        two or more with room to spare is Ollama unable to start runners, whose
+        only known recovery is a full restart — quit the Electron parent, reap
+        ``llama-server``, relaunch.
+
+        **This check does not act.** An "Ollama watchdog" that probed and killed
+        stuck runners was removed 2026-04-23 after its escalation to a full
+        ``ollama serve`` restart wiped every pinned model, triggered by a probe
+        that read a 400 from an embedding model as a stuck runner. Naming the
+        cause is the useful half; restarting Ollama stays a human's call.
         """
         recs = []
         if timeouts["total_count"] < 3:
             return recs
+
+        # Fleet-wide context, computed once: is this plausibly eviction at all?
+        free_gb = _free_memory_gb(nodes)
+        models_timing_out = sum(
+            1 for info in timeouts["by_model"].values() if info["count"] >= 3
+        )
+        ollama_wedged = models_timing_out >= 2 and free_gb >= _OVERSIZE_HEADROOM_GB
 
         # Find the worst-offending models
         for model, info in timeouts["by_model"].items():
@@ -3020,15 +3052,40 @@ class HealthEngine:
                         description=(
                             f"{info['count']} timeout(s) for {model} in the last 24h "
                             f"({recent_count} in the last hour) on {node_list}. "
-                            f"The model is likely being evicted from memory and can't "
-                            f"reload before the request timeout."
+                            + (
+                                f"{models_timing_out} different models are timing "
+                                f"out while {free_gb:.0f} GB is free, so this is not "
+                                f"eviction — Ollama is likely unable to start any new "
+                                f"runner. It can answer /api/version and /api/ps in "
+                                f"under a millisecond in this state, so a green "
+                                f"liveness probe means nothing here."
+                                if ollama_wedged
+                                else "The model is likely being evicted from memory "
+                                "and can't reload before the request timeout."
+                            )
                         ),
                         fix=(
-                            f"Keep {model} loaded: "
-                            f"curl http://localhost:11434/api/generate "
-                            f"-d '{{\"model\":\"{model}\",\"keep_alive\":-1}}'. "
-                            f"Or set OLLAMA_MAX_LOADED_MODELS=-1 to let Ollama "
-                            f"fill available memory."
+                            (
+                                "Confirm with a direct, non-herd request: `curl -m 120 "
+                                "localhost:11434/api/generate -d "
+                                "'{\"model\":\"<model>\",\"prompt\":\"hi\"}'`. "
+                                "If that hangs while /api/version answers instantly, "
+                                "restart Ollama — quit the **Electron parent** "
+                                "(Ollama.app/Contents/MacOS/Ollama), not just `ollama "
+                                "serve`, then reap orphaned `llama-server` and "
+                                "relaunch. See docs/troubleshooting.md. herd "
+                                "deliberately does not do this for you: the watchdog "
+                                "that did was removed 2026-04-23 after its escalation "
+                                "wiped every pinned model."
+                            )
+                            if ollama_wedged
+                            else (
+                                f"Keep {model} loaded: "
+                                f"curl http://localhost:11434/api/generate "
+                                f"-d '{{\"model\":\"{model}\",\"keep_alive\":-1}}'. "
+                                f"Or set OLLAMA_MAX_LOADED_MODELS=-1 to let Ollama "
+                                f"fill available memory."
+                            )
                         ),
                         data={
                             "model": model,

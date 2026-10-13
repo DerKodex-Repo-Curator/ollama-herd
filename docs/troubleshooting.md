@@ -311,6 +311,63 @@ reasoning tokens — verified: `num_predict=24` gave `eval_count=24` with zero
 content), and the 48,000-odd traces that carry `NULL` counts because their route
 never surfaces them (embeddings, MLX). `NULL` is not zero.
 
+## Models time out loading while Ollama looks perfectly healthy
+
+Ollama can answer `/api/version` and `/api/ps` in **under a millisecond** while
+being unable to start *any* new runner. A green liveness probe means nothing in
+this state, which is what makes it hard to see.
+
+Reproduced 2026-10-11 after repeatedly loading `glm-4.7-flash`: a direct,
+non-herd request for `gemma3:27b` hung the full 300 s with **350 GB free, zero
+swap, and kernel memory pressure normal.**
+
+**Telling it apart from eviction** — the two share the symptom and have opposite
+fixes:
+
+| | eviction | Ollama wedged |
+|---|---|---|
+| how many models time out | usually one | **two or more** |
+| memory | tight | **ample** |
+| fix | `keep_alive: -1`, bigger hot-model cap | **restart Ollama** |
+
+The `model_load_timeout` health check makes this call for you since 0.11.2 and
+names the cause. Before that it asserted eviction and advised `keep_alive: -1`,
+which was already set.
+
+**Confirm it yourself before restarting anything** — bypass herd entirely, so a
+hang cannot be blamed on the router:
+
+```bash
+curl -m 120 localhost:11434/api/generate -d '{"model":"<a resident model>","prompt":"hi","stream":false}'
+curl -m 10 localhost:11434/api/version     # answers instantly even while wedged
+```
+
+If the first hangs and the second returns, Ollama is wedged. The recovery is the
+full restart, and **the Electron parent is the part people miss**:
+
+```bash
+launchctl bootout gui/$UID/com.geeksaccelerator.ollama-herd.node   # stop the node racing to restart Ollama
+pkill -f "Ollama.app/Contents/MacOS/Ollama"                        # the parent, not just `ollama serve`
+pkill -f "ollama serve"
+ps -Ao pid,ppid,args | grep "[l]lama-server" | awk '$2==1{print $1}' | xargs -r kill -9
+open -a Ollama
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.geeksaccelerator.ollama-herd.node.plist
+curl -s localhost:11434/api/version        # a relaunch can change the version
+```
+
+Then reload each model **through the router** (`:11435`) so its configured
+`num_ctx` is applied on the cold load. After the 2026-10-11 recovery, gemma3
+loaded in 7.3 s and gpt-oss answered in 1.3 s.
+
+**herd will not do this for you, deliberately.** An "Ollama watchdog" that
+probed and killed stuck runners was removed 2026-04-23: its probe picked the
+smallest loaded model, which selected an embedding-only model, `/api/chat` on
+which returns 400, which it read as a stuck runner — 13 kicks in 13 minutes and
+then an escalation to a full restart that **wiped every pinned model**. Detection
+without remediation is the deliberate trade.
+
+---
+
 ## One model is resident twice (an Ollama upgrade rewrote its digest)
 
 `ollama ps` shows the same model name on two rows, each holding its own copy of

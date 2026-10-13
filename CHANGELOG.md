@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`model_load_timeout` now says which of two causes it is.** The check was written for eviction — a model keeps getting pushed out, and reloading outruns the request timeout — and asserted that cause unconditionally. There is a second cause with the identical symptom and the opposite fix: Ollama can answer `/api/version` and `/api/ps` in under a millisecond while unable to start *any* new runner. Reproduced 2026-10-11, where a direct non-herd request hung the full 300 s with **350 GB free, zero swap and kernel pressure normal**, while the card advised `keep_alive: -1` (already set) and `OLLAMA_MAX_LOADED_MODELS` (already 10). The discriminator needs no new data: **two or more distinct models timing out while memory is ample cannot be eviction.** The card now names the wedge, warns that a green liveness probe means nothing in that state, gives a direct non-herd command to confirm, and points at the restart recipe.
+
+  **Detection only, deliberately.** The "Ollama watchdog" that probed and killed stuck runners was removed 2026-04-23 after its escalation to a full `ollama serve` restart wiped every pinned model — triggered by a probe that selected an embedding-only model and read its 400 as a stuck runner. A test asserts this check never shells out, so it cannot grow back into that by accident.
+
+### Fixed
+
+- **`event_stream()` re-read `request.app.state` on every tick.** The SSE handles are set at startup and never rebound, so re-fetching them every 2 s for the life of every open dashboard tab was pure overhead. Captured once above the loop.
+
+- **Two tests that verified nothing now do.** `test_move_pending` asserted `moved >= 0`, vacuous for a non-negative int — it now asserts the invariants that survive the worker-pickup race: the count cap, conservation between source and target, on-demand target creation, and that each moved entry's `assigned_node` was actually reassigned, which is the point of the move and was unchecked. `test_shutdown`'s body was `pass  # No assertion needed` — it now captures the worker tasks and reaper before shutdown and asserts they are cancelled afterwards.
+
 ## [0.11.1] - 2026-10-12
 
 ### Fixed

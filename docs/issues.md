@@ -2000,9 +2000,44 @@ When an Ollama native image model (e.g., `x/z-image-turbo` at 12GB) is requested
 
 ---
 
-### Ollama watchdog can't escalate to `ollama serve` restart `OPEN`
+### Ollama watchdog can't escalate to `ollama serve` restart `OBSOLETE AS WRITTEN` (2026-10-13)
 
-**File:** `src/fleet_manager/node/ollama_watchdog.py`
+> **⚠️ Do not implement the proposed fixes below as written — fix #1 is the
+> mechanism that caused a production incident.**
+>
+> **The component this issue is about no longer exists.** `node/ollama_watchdog.py`
+> was **removed 2026-04-23**, and `models/config.py` records why: its probe picked the
+> *smallest* loaded model as the chat-probe target, which selected embedding-only
+> models like `nomic-embed-text`; `/api/chat` on an embedding model returns 400; the
+> watchdog read that as a stuck runner. Cascade: **13 kicks in ~13 minutes, then
+> escalation to a full `ollama serve` restart that wiped every pinned model.** Fix #1
+> below is "add escalation to restart `ollama serve`" — i.e. the exact behaviour that
+> did the damage.
+>
+> **The underlying failure mode is real and still unaddressed**, and was reproduced
+> 2026-10-11 after repeatedly loading `glm-4.7-flash`: Ollama answered `/api/version`
+> and `/api/ps` in under a millisecond while unable to start *any* new runner. A
+> direct, non-herd request for `gemma3:27b` hung the full 300 s with **350 GB free,
+> zero swap and kernel pressure normal**. Recovery needed the documented full restart
+> (quit the Electron parent, reap `llama-server`, relaunch), after which gemma3 loaded
+> in 7.3 s.
+>
+> **What shipped instead (2026-10-13): detection without remediation.**
+> `_check_model_load_timeouts` now distinguishes the two causes that share this
+> symptom. It previously asserted eviction and advised `keep_alive: -1` — which was
+> already set during the incident — plus `OLLAMA_MAX_LOADED_MODELS`, already 10. The
+> discriminator needs no new data: **two or more distinct models timing out while
+> memory is ample cannot be eviction**, which requires pressure and would not pick on
+> everything at once. The card now names the wedge, warns that a green liveness probe
+> means nothing in this state, gives a direct non-herd command to confirm it, and
+> points at the restart recipe. A test asserts the check never shells out, so it
+> cannot grow into the watchdog again by accident.
+>
+> **If automated recovery is ever revisited**, `config.py` already states the two
+> preconditions: (a) explicit probe-model allowlisting, never size-based, and (b)
+> per-cause cooldowns so a guaranteed-failing probe cannot escalate.
+
+**File:** ~~`src/fleet_manager/node/ollama_watchdog.py`~~ (removed 2026-04-23); detection now in `server/health_engine.py`
 **Severity:** High (root cause of multi-hour gpt-oss outages)
 
 The watchdog detects stuck `/api/chat` and kills `ollama runner` processes via `pkill -9`. That recovers the case where `ollama serve` is healthy but a runner is wedged. It does **not** recover the more pernicious case where `ollama serve` itself has accumulated state corruption — `/api/tags` keeps answering, runners keep getting kicked, but each respawn wedges immediately under load.
@@ -2338,7 +2373,12 @@ The `arch` field defaults to `"apple_silicon"`, which is incorrect for non-Mac n
 
 ---
 
-### 8. `event_stream()` Re-fetches State Every Tick `OPEN`
+### 8. `event_stream()` Re-fetches State Every Tick `FIXED` (2026-10-13)
+
+> `registry`, `queue_mgr` and `mlx_proxy` are now captured once above the `while`
+> loop. They are set during app startup and never rebound, so re-reading them every
+> 2 s for the life of every open dashboard tab was pure overhead — and it obscured
+> that the loop body's real cost is rebuilding fleet state, not fetching handles.
 
 **File:** `src/fleet_manager/server/routes/dashboard.py`
 **Severity:** Low
@@ -2386,7 +2426,15 @@ The rebalancer in particular has meaningful logic (deciding when to move pending
 
 ---
 
-### 11. `test_move_pending` — Tautological Assertion `OPEN`
+### 11. `test_move_pending` — Tautological Assertion `FIXED` (2026-10-13)
+
+> `assert moved >= 0` was vacuous, and it was written that way for a real reason:
+> how many entries a worker has already claimed is nondeterministic. So the fix is
+> not a fixed count but the **invariants that hold regardless of that race** — the
+> count cap, conservation (what left the source arrived at the target), the target
+> queue being created with its node parsed from the key, and every moved entry
+> having `assigned_node` reassigned, which is the whole point of the move and was
+> previously unchecked.
 
 **File:** `tests/test_server/test_queue_manager.py`
 **Severity:** Low
@@ -2397,7 +2445,15 @@ The test asserts `moved >= 0`, which is always true for a non-negative integer. 
 
 ---
 
-### 12. `test_shutdown` — Vacuous Test `OPEN`
+### 12. `test_shutdown` — Vacuous Test `FIXED` (2026-10-13)
+
+> The body was `pass  # No assertion needed`. It now captures the worker tasks and
+> the reaper *before* shutdown — the only point at which their state is meaningful
+> — and asserts all are cancelled or done afterwards, plus that the never-finishing
+> entry was not counted as a completion. Two details the fix had to get right:
+> `cancel()` only *requests* cancellation, so it yields to the loop before
+> asserting; and the reaper is started by an explicit `start_reaper()`, not by
+> `enqueue`, so the test starts it deliberately rather than assuming.
 
 **File:** `tests/test_server/test_queue_manager.py`
 **Severity:** Low

@@ -156,10 +156,15 @@ async def dashboard_events(request: Request):
         # reader that will never read again — one such stuck stream per stale
         # tab, accumulating.  `is_disconnected()` is how Starlette exposes that
         # the peer has gone; check it before doing the work.
+        # Captured once, not per tick.  These are set during app startup and
+        # never rebound, so re-reading them every 2 s for the life of every open
+        # dashboard tab is pure overhead -- and it obscured that the loop body's
+        # cost is rebuilding fleet state, not fetching these handles.
+        registry = request.app.state.registry
+        queue_mgr = request.app.state.queue_mgr
+        mlx_proxy = getattr(request.app.state, "mlx_proxy", None)
+
         while not await request.is_disconnected():
-            registry = request.app.state.registry
-            queue_mgr = request.app.state.queue_mgr
-            mlx_proxy = getattr(request.app.state, "mlx_proxy", None)
 
             nodes = []
             for node in registry.get_all_nodes():

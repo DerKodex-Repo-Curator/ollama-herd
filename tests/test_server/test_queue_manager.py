@@ -192,12 +192,30 @@ class TestQueueManager:
         # Give workers time to pick up first item
         await asyncio.sleep(0.1)
 
-        # Move pending items to a different queue
-        moved = await qm.move_pending(
-            "overloaded:llama3.3:70b", "underloaded:llama3.3:70b", 2
-        )
-        # At least some should have moved (worker may have picked up 1)
-        assert moved >= 0
+        src_key, dst_key = "overloaded:llama3.3:70b", "underloaded:llama3.3:70b"
+        pending_before = qm._queues[src_key].pending.qsize()
+
+        moved = await qm.move_pending(src_key, dst_key, 2)
+
+        # `assert moved >= 0` was the original assertion and is vacuous for a
+        # non-negative int.  It was written that way because how many entries a
+        # worker has already claimed is genuinely nondeterministic -- so assert
+        # the invariants that hold regardless of that race, not a fixed count.
+        assert moved <= 2, "must respect the count cap"
+        assert moved <= pending_before, "cannot move more than was pending"
+        # Conservation: every entry that left the source arrived at the target.
+        assert qm._queues[src_key].pending.qsize() == pending_before - moved
+        assert qm._queues[dst_key].pending.qsize() == moved
+        # The target queue is created on demand, with the node parsed from its key.
+        assert dst_key in qm._queues
+        assert qm._queues[dst_key].node_id == "underloaded"
+        assert qm._queues[dst_key].model == "llama3.3:70b"
+        # And the point of moving: each entry is now assigned to the new node,
+        # which is what the router acts on.  Checked by draining, so a move that
+        # copied the entry without reassigning it would fail here.
+        for _ in range(moved):
+            entry, _future, _fn = qm._queues[dst_key].pending.get_nowait()
+            assert entry.assigned_node == "underloaded"
         await qm.shutdown()
 
     async def test_move_pending_nonexistent_source(self):
@@ -217,12 +235,32 @@ class TestQueueManager:
 
         await qm.enqueue(entry, process)
         await asyncio.sleep(0.05)
+
+        # Capture the tasks before shutdown -- afterwards is the only time their
+        # state is meaningful, and the body used to be `pass  # No assertion
+        # needed`, which verified only that nothing raised.
+        workers = [t for q in qm._queues.values() for t in q.worker_tasks]
+        assert workers, "fixture precondition: at least one worker was started"
+        # The reaper is started by an explicit `start_reaper()` (the app lifespan
+        # calls it), not by `enqueue`, so start it here deliberately -- shutdown
+        # cancels it too, and that is worth covering rather than skipping.
+        qm.start_reaper()
+        reaper = qm._reaper_task
+        assert reaper is not None
+
         await qm.shutdown()
-        # Worker tasks should be cancelled
-        info = qm.get_queue_info()
-        for key, q_info in info.items():
-            # Workers should be done/cancelled
-            pass  # No assertion needed — just checking no exceptions
+        # cancel() only *requests* cancellation; the task settles on the next
+        # loop pass, so yield before asserting or this races the event loop.
+        await asyncio.sleep(0)
+
+        assert all(t.cancelled() or t.done() for t in workers), (
+            "every worker task must be cancelled or finished after shutdown"
+        )
+        assert reaper.cancelled() or reaper.done(), "the reaper must be cancelled too"
+        # The entry never completed (its process sleeps 100s), so shutdown must
+        # not have counted it as a success.
+        for q in qm._queues.values():
+            assert q.completed_count == 0
 
     async def test_multiple_queues_independent(self):
         qm = QueueManager()
