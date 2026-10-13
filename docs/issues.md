@@ -1824,7 +1824,24 @@ that reports nothing is indistinguishable from one that is broken.
 
 ---
 
-### Long-context requests starve co-resident decode with no admission control `OPEN`
+### Long-context requests starve co-resident decode with no admission control `NO EVIDENCE` (2026-10-13)
+
+> **Measured against 24 h of live traffic (n=6,554) and the title does not hold.** The
+> decode distribution *is* bimodal — a fast mode at ≥70 tok/s and a slow one at <45 —
+> which looks like support. But prompt size does not discriminate the modes:
+>
+> | | prompt tokens (median) | completion | TTFT | **overlapping requests** |
+> |---|---|---|---|---|
+> | fast (≥70 tok/s) | 835 | 193 | 483 ms | **0.77** |
+> | slow (<45 tok/s) | 864 | 207 | 665 ms | **3.42** |
+>
+> Identical prompts; 4.4x the concurrency. It is not long context, it is plain
+> co-tenancy on a bandwidth-bound box — already documented and measured in CLAUDE.md
+> (single-stream gemma3 22.5 tok/s, four slots 27.1, i.e. 1.2x of one slot), and
+> accepted rather than defective. **Admission control would not address what is
+> actually happening.** Kept open only in case a long-context workload later produces
+> the effect the title describes; see
+> [`plans/next-issues-worth-doing.md`](plans/next-issues-worth-doing.md).
 
 **Severity:** medium-high (tail latency).
 
@@ -1979,7 +1996,12 @@ The node-side watchdog periodically sent a chat probe to Ollama to detect stuck 
 
 If stuck-runner detection is ever needed again, re-add it with: (a) an **explicit allowlist** of chat-capable probe models, never size-based selection; (b) per-cause cooldowns so a guaranteed-failing probe can't escalate; (c) hard cap on serve-restart escalations per hour.
 
-### Ollama native image models can evict LLMs from memory `PARTIAL`
+### Ollama native image models can evict LLMs from memory `PARTIAL — DORMANT` (2026-10-13)
+
+> **Severity is right about the mechanism; probability here is currently zero.** Last
+> image request on this fleet: **2026-03-30**. 105 image traces all time,
+> `image_generations_24h: 0`. Re-read this before the next image-generation work
+> rather than scheduling it now.
 
 **File:** `src/fleet_manager/server/routes/ollama_compat.py`
 **Severity:** High
@@ -2178,7 +2200,21 @@ SD3.5 Large (11.6GB peak memory) occasionally triggers a "Python quit unexpected
 
 ## Performance (Will Bite at Scale)
 
-### `available_gb` is the wrong ceiling for "can this model fit?" `OPEN` (needs a design decision)
+### `available_gb` is the wrong ceiling for "can this model fit?" `OPEN — NO CURRENT HARM` (2026-10-13)
+
+> **Real design flaw, no evidence of present harm, and a wide blast radius — so not
+> the thing to pick up next.** Measured 2026-10-13: **zero** rejections all-time
+> attributable to memory elimination, **3** `fallback_used` traces in the last 30 days
+> (38,826 all-time, so it is historical), and `available_gb` sampled six times over
+> 12 s read 373.9 / 373.9 / 373.9 / 374.1 / 374.1 / 373.2 — the documented 17 GB →
+> 445 GB volatility does not reproduce. The field has **~20 consumers**, so changing
+> its meaning is a wide edit for a failure that is not currently occurring.
+>
+> **Prerequisite if revisited:** the obvious fix is to prefer the capacity learner's
+> smoothed `capacity.ceiling_gb`, but `capacity` is **empty in the live heartbeat**,
+> so that ceiling would have to be made real first — which is its own question, since
+> `queue_manager` already does `min(available_gb, ceiling_gb)` and therefore never
+> engages that guard today.
 
 **Files:** `src/fleet_manager/server/scorer.py`, `src/fleet_manager/server/model_preloader.py`
 **Severity:** Medium (real request failures, narrow + self-healing window)
