@@ -69,6 +69,74 @@ Leave it filed, and re-read it before the next image work rather than now.
 
 ---
 
+## What the codebase audit changed (2026-10-13)
+
+Three findings, and the first removes most of Phase 1.
+
+### The right statistic already exists, and is already consumed correctly
+
+`trace_store.get_decode_latency_stats` computes **p99 TPOT per `node:model`,
+recent window against that model's own 24 h baseline**, and
+`_check_decode_degraded` fires at a 2.0x ratio. Its docstring already says why
+per-request tok/s is the wrong measure — *"conflates all three and will happily
+blame a model for time it spent waiting in a queue — which is exactly how the
+2026-07-19 `glm-4.7-flash` investigation lost several hours."*
+
+**So the metric I was about to invent ("fast-mode share") is not needed**, and
+adding it would put a second throughput statistic beside the one this project
+already chose and documented. Phase 1 becomes a pointer to existing material
+plus one measurement, not a new concept.
+
+**And I verified the existing check is not exposed to the bimodality**, by
+replaying its own comparison across 48 half-hour windows:
+
+| | |
+|---|---|
+| worst recent-p99 / baseline-p99 ratio observed | **1.33x** |
+| firing threshold (`DECODE_DEGRADED_RATIO`) | 2.0x |
+| margin | **1.51x** |
+| windows that would have fired | **0** |
+| times it has ever fired, any log | **0** |
+
+Worth recording as a watch item rather than a change: p99 TPOT varies more
+hour-to-hour (49% of mean) than median tok/s does (34%), so the margin is
+thinner than the threshold suggests. It holds today; it is not enormous.
+
+**One correction to my own framing.** I had assumed the bimodality was an
+artifact of choosing tok/s. It is not — binned both ways, the two modes are
+present in TPOT as well (a dominant mode at 10–15 ms and a shoulder at 25–30 ms).
+The phenomenon is real; what was wrong was reporting its *median*.
+
+### Phase 2 has an existing hook, and a constraint not to break
+
+Both CLIs are structurally identical: `load_env_file()` at module scope on line
+15, then `app = typer.Typer(...)`, then `@app.callback(invoke_without_command=True)
+def start(...)`. **That callback is the hook** — Typer runs a group callback
+before any subcommand, so moving the call into it covers `herd`, `herd mlx pull`,
+`herd mlx list` and `herd mlx serve` without inventing a pattern.
+
+**The constraint:** the module-scope placement is deliberate and documented —
+*"`ServerSettings` is only imported inside `start()` below, so calling
+`load_env_file()` here at module-import time is early enough."* The fix must keep
+the env file loading **before** any settings class instantiates, and should
+update that comment rather than delete it.
+
+**And a correction to this plan:** the test I referenced is
+`tests/test_models/test_cli_env_precedence.py`, not `test_server/`. Its claim
+stands though — lines 51–96 read the CLI files with `read_text()` specifically to
+avoid importing them, which is the dodge the fix would make unnecessary.
+
+### Phase 3 needs no new harness
+
+`common/discovery.py` imports `zeroconf` (a declared dependency) and uses
+`AsyncZeroconf`, `AsyncServiceBrowser` and `AsyncServiceInfo`. Two established
+mocking patterns already exist to follow: `monkeypatch.setattr` for a shelled-out
+dependency (`test_backend_clients.py`, for `lsof`) and `MagicMock` / `AsyncMock`
+for an async client (`test_mlx_client.py`). Use those rather than adding a
+fixture layer.
+
+---
+
 ## What does have evidence
 
 ### 1. The bimodal decode distribution is being misread — document it
@@ -122,7 +190,15 @@ where its logic lives.
 
 ## Implementation principles
 
-- **No new `FLEET_*` flags.** None of this needs one.
+- **No new `FLEET_*` flags.** None of this needs one, and the audit confirmed
+  none of the three phases has a side effect outside herd that would justify an
+  opt-in — which is the only category this project allows.
+- **No second metric, no second code path.** The audit's main finding is that the
+  throughput statistic was already chosen and documented; adding "fast-mode
+  share" beside it would have been exactly the debt this rule forbids. Same
+  reasoning for Phase 2: the fix uses the Typer callback that already exists
+  rather than adding an initialization layer, and Phase 3 uses the two mocking
+  patterns already in the suite rather than a third.
 - **Measure before designing.** This plan exists because two items ranked by
   filed severity collapsed under one query each.
 - **Documentation counts as a fix** when the defect is that a healthy signal
@@ -130,35 +206,58 @@ where its logic lives.
 
 ---
 
-## Phase 1 — Write down why the median swings (no code)
+## Phase 1 — Point at the statistic that already exists (docs only)
 
-Record in `docs/troubleshooting.md` and the CLAUDE.md throughput note: the decode
-distribution is bimodal, the modes are "running alone" vs "overlapping ~3 others",
-prompt size does **not** discriminate them, and the fast-mode share is the stable
-reading. Include the measured table above so the next person does not re-derive it.
+Smaller than first drafted, because the audit found the measure is already
+chosen. Record in `docs/troubleshooting.md` and the CLAUDE.md throughput note:
+
+- The decode distribution is bimodal, and the modes are **"running alone" vs
+  "overlapping ~3 others"** — 0.77 vs 3.42 concurrent requests, with **identical
+  prompt sizes** (835 vs 864 tokens median).
+- Therefore the per-request **median tok/s is unstable by construction** — it
+  sits in the valley between the modes and swings 42–79 on a healthy fleet.
+- **The answer is not a new metric.** Use `get_decode_latency_stats`' p99 TPOT
+  against a model's own baseline, which is what `decode_degraded` already does
+  and what that function's docstring already argues for.
+- Note the measured margin (1.33x observed against a 2.0x threshold) so a future
+  reader knows the check is safe *and* by how much.
 
 **Done when** a reader who sees median 77 → 60 can tell in one step whether the
-mix moved or the fleet slowed — and the "long-context starvation" issue is
-annotated with the measurement that contradicts its title.
+mix moved or the fleet slowed, and is pointed at the existing check rather than
+inventing a statistic — plus the "long-context starvation" issue carries the
+measurement that contradicts its title (**done 2026-10-13**).
 
 ## Phase 2 — Stop the CLI import from mutating `os.environ`
 
-Move `load_env_file()` out of module scope into the Typer command bodies (or an
-explicit `main()`), so importing the module is side-effect free while both
-entry points keep loading `~/.fleet-manager/env` exactly as documented.
+Move `load_env_file()` from module scope into the **existing**
+`@app.callback(invoke_without_command=True)` in each CLI — Typer runs a group
+callback before any subcommand, so one line per file covers every entry point and
+no new pattern is introduced.
+
+**Preserve the ordering the current comment defends:** the env file must load
+before any settings class instantiates, which holds because `ServerSettings` is
+imported *inside* `start()`. Update that comment to say where the call moved and
+why the guarantee still holds; do not delete it.
 
 **Done when** a test asserts that importing `fleet_manager.cli.server_cli` and
 `node_cli` injects **no** `FLEET_*` variable, and both binaries still pick up the
-env file — verified by running them, not by reading the code. Note the existing
-`tests/test_server/test_cli_env_precedence.py` deliberately reads the CLI as
-*text* to dodge this very problem; it should go back to importing once fixed,
-which is the real proof.
+env file — verified by running them, not by reading the code. Note that
+`tests/test_models/test_cli_env_precedence.py` reads the CLI files with
+`read_text()` (lines 51–96) specifically to avoid importing them; those checks
+should become real imports once fixed, which is the actual proof.
 
 ## Phase 3 — Cover `discovery`, then `rebalancer`
 
 `discovery` first: it is zero-coverage and it is the path that fails when a
 network changes, which this fleet has hit (the node-identity gotcha). Then
 `rebalancer`'s move / pre-warm decisions.
+
+Follow the two mocking patterns already in the suite rather than adding a layer:
+`monkeypatch.setattr` for a shelled-out dependency (as `test_backend_clients.py`
+does for `lsof`) and `MagicMock` / `AsyncMock` for an async client (as
+`test_mlx_client.py` does). `discovery` wraps `zeroconf`'s `AsyncZeroconf`,
+`AsyncServiceBrowser` and `AsyncServiceInfo`, all of which that second pattern
+covers.
 
 **Done when** both have tests of their own rather than incidental coverage, and
 `docs/issues.md` item 10 can close rather than narrow again.
