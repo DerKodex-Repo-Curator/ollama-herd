@@ -6,6 +6,34 @@ Identified via code review of the full codebase. Organized by priority.
 
 ---
 
+## How to read this file
+
+**Counting `###` headings overstates the open work.** As of 2026-10-13 a naive scan
+found 43 candidates; **21** are genuinely open and **18** are `###` sub-headings *inside*
+`##` sections that are already `RESOLVED` or `PARTLY RESOLVED` — "Evidence", "Prototype
+sketch", "Three levers evaluated and closed", and so on. Those are structure, not issues.
+Exclude any `###` whose parent `##` carries a resolution marker.
+
+**And a triage pass is worth more than it sounds.** The 2026-10-13 pass closed **5** of
+the 26 it examined, not because anything was fixed that day but because the work had
+shipped and the entry was never updated:
+
+| entry | why it was already done |
+|---|---|
+| MLX subsystem premise | decided *hold* on 2026-10-11 and recorded only in the plan |
+| Dynamic `num_ctx` (all 3 phases) | shipped; Phase 2 recommends live right now |
+| `OLLAMA_NUM_PARALLEL` KV bloat | its "Remaining" item *is* `FLEET_DYNAMIC_NUM_CTX` |
+| `HeartbeatPayload.arch` | `collector._detect_arch` exists and cites issue #1 |
+| Unused imports | ruff selects `F`, so `F401` runs on every check and passes |
+
+Two earlier passes found the same thing: on 2026-10-11 the `/api/ps` `context_length`
+contradiction was settled by one measurement, and the "Ollama 3-model cap" had been
+disproven on 2026-07-17 while CLAUDE.md carried the refutation and this file still said
+`OPEN`. **An agent reading this file and one reading CLAUDE.md would have disagreed on
+all three.** Re-triage before planning work off this list.
+
+---
+
 ## Correctness
 
 ### A native embed or rerank with no node to serve it returned a silent 503 that blamed the wrong thing `FIXED` (2026-10-04)
@@ -2014,7 +2042,18 @@ The watchdog detects stuck `/api/chat` and kills `ollama runner` processes via `
 
 ## External Dependencies
 
-### Ollama ships a native MLX runner — our MLX subsystem's premise is stale `OPEN` (investigate first)
+### Ollama ships a native MLX runner — our MLX subsystem's premise is stale `RESOLVED — HOLD` (2026-10-11)
+
+> **Decided: hold.** Keep `mlx_lm.server`, stop extending it, do not measure Ollama-MLX
+> feature parity. `GLM-4.7-Flash` is the deciding workload and the measurement is not
+> close — all-time on this box, Ollama has **30 completions against 235 requests retried
+> at the 600 s timeout and 12 failures** (worst 87 min), while MLX has **27 completions
+> and 1 failure** and answers in ~3 s. **89% of Ollama attempts never completed
+> normally.** So the subsystem is the only working path for a model this fleet serves,
+> not dormant capability kept on sentiment — and that holds for any open-source user
+> running GLM. What would reopen it: Ollama fixing `glm4moelite`
+> ([ollama#14045](https://github.com/ollama/ollama/issues/14045)). Full reasoning:
+> [`plans/ollama-mlx-runner-subsystem-decision.md`](plans/ollama-mlx-runner-subsystem-decision.md).
 
 **Files:** `src/fleet_manager/node/mlx_supervisor.py`, `src/fleet_manager/server/mlx_proxy.py`, `scripts/setup-mlx.sh`, `CLAUDE.md`
 **Severity:** Medium–High (strategic — a large subsystem may be redundant; **plus** load-bearing constants may be wrong)
@@ -2263,7 +2302,14 @@ Route handlers in `openai_compat.py` and `ollama_compat.py` accessed the private
 
 ---
 
-### 6. Unused Dependencies and Imports `OPEN`
+### 6. Unused Dependencies and Imports `NARROWED` (2026-10-13)
+
+> **The imports half is enforced and clean.** `pyproject.toml` selects ruff rule set
+> `"F"`, which includes `F401`, and `uv run ruff check --select F401 src/` passes — so
+> an unused import cannot land. What remains is only unused *dependencies* in
+> `pyproject.toml`, which ruff does not check; that needs a tool like `deptry` or a
+> manual pass, and is cosmetic until it affects install size (it inflates the Homebrew
+> formula's resource list, where every dep is built from source).
 
 **Files:** `pyproject.toml`, `src/fleet_manager/server/app.py`
 **Severity:** Low
@@ -2276,7 +2322,12 @@ Route handlers in `openai_compat.py` and `ollama_compat.py` accessed the private
 
 ---
 
-### 7. `HeartbeatPayload.arch` — Hardcoded Default `OPEN`
+### 7. `HeartbeatPayload.arch` — Hardcoded Default `FIXED` (verified 2026-10-13)
+
+> The field now defaults to `"unknown"` and is populated by `collector._detect_arch`,
+> which branches on `platform.system()` / `platform.machine()`. Its docstring cites
+> issue #1 — Linux and NVIDIA boxes reporting Apple hardware — as the reason, so this
+> was fixed as part of that work and never marked here.
 
 **File:** `src/fleet_manager/models/` (HeartbeatPayload definition)
 **Severity:** Low
@@ -2311,19 +2362,25 @@ The dashboard is a large amount of inline HTML/CSS/JS in Python strings across 5
 
 ## Test Coverage Gaps
 
-### 10. Untested Modules `PARTIAL`
+### 10. Untested Modules `PARTIAL` (narrowed 2026-10-13 — 2 of 4 now covered)
 
 **Severity:** Medium
 
 The following modules still have zero test coverage:
 
-- `server/rebalancer.py` — pre-warm trigger and queue move logic
-- `common/discovery.py` — mDNS advertise and browse
-- `common/system_metrics.py` — psutil metric collection
-- `common/ollama_client.py` — Ollama HTTP client
+- `common/discovery.py` — mDNS advertise and browse. **Still zero.**
+- `server/rebalancer.py` — pre-warm trigger and queue move logic. **Thin rather than
+  zero:** exercised indirectly by `test_streaming_failures.py` and `test_routes.py`, but
+  with no tests of its own for the move / pre-warm decisions, which is where the logic
+  actually lives.
 
-Previously untested, now covered:
-- ~~`node/agent.py`~~ — now has 6 tests in `tests/test_node/test_agent.py`
+Previously untested, now covered (verified 2026-10-13):
+- ~~`node/agent.py`~~ — 6 tests in `tests/test_node/test_agent.py`
+- ~~`common/system_metrics.py`~~ — covered by `test_memory_pressure_gating.py` and
+  `test_swap_visibility.py`, written when the macOS pressure probe turned out to be dead
+  code and when swap reporting was added
+- ~~`common/ollama_client.py`~~ — covered by `test_client_compat.py` and
+  `test_loaded_model_runner_digest.py`, the latter pinning the real `/api/ps` payload
 
 The rebalancer in particular has meaningful logic (deciding when to move pending requests, triggering pre-warm) that warrants unit tests.
 
@@ -2381,7 +2438,16 @@ The tagging system records tags on every trace and provides a dedicated Apps das
 
 ---
 
-### 16. OLLAMA_NUM_PARALLEL Auto-Calculation Causes KV Cache Bloat and Model Thrashing `PARTIAL`
+### 16. OLLAMA_NUM_PARALLEL Auto-Calculation Causes KV Cache Bloat and Model Thrashing `FIXED` (verified 2026-10-13)
+
+> **The "Remaining" item below shipped.** It reads *"could inject `num_ctx` overrides in
+> proxied requests to cap context windows"* — that is `FLEET_DYNAMIC_NUM_CTX` +
+> `FLEET_NUM_CTX_OVERRIDES`, enabled on this fleet and covering every request format
+> since 0.11.1. The detection half (`_check_kv_cache_bloat`) was already noted as
+> implemented, and was itself corrected on 2026-10-09 after it was found inventing
+> 12 GB from guessed weights. The user-side half (`OLLAMA_NUM_PARALLEL=2..4`) is set to
+> 4 here, and the router mirrors it per model via `decode_parallelism_for` rather than
+> assuming.
 
 **Severity:** High
 
@@ -2414,7 +2480,15 @@ launchctl setenv OLLAMA_NUM_PARALLEL 2
 
 ---
 
-### 21. Dynamic `num_ctx` Management Based on Actual Usage `PARTIAL`
+### 21. Dynamic `num_ctx` Management Based on Actual Usage `FIXED` (verified 2026-10-13)
+
+> **All three phases shipped.** Phase 1 (observe): `trace_store.get_prompt_token_stats`
+> plus the `context_waste` check. Phase 2 (recommend): live right now —
+> *"gpt-oss:120b alloc 131072, p99 5326, recommended 16384"*. Phase 3 (auto-adjust):
+> `server/context_optimizer.py` with `_auto_initialize_overrides`, `_check_and_optimize`
+> and an `_auto_set` ledger so it never overwrites an operator's own override, gated by
+> `FLEET_DYNAMIC_NUM_CTX` exactly as the plan specified. Since 0.11.1 the injection
+> applies on **every** request format, not just Ollama's.
 
 **Severity:** Medium
 **Files:** New module + `server/streaming.py`, `server/routes/dashboard.py` (settings)
